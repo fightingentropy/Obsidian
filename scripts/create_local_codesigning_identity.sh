@@ -2,10 +2,10 @@
 
 set -euo pipefail
 
-name="${1:-Markdown}"
+name="${1:-Obsidian}"
 keychain="${KEYCHAIN_PATH:-$HOME/Library/Keychains/login.keychain-db}"
 tmpdir="$(mktemp -d)"
-p12_password="${P12_PASSWORD:-markdown-local}"
+p12_password="${P12_PASSWORD:-obsidian-local}"
 
 cleanup() {
   rm -rf "$tmpdir"
@@ -25,7 +25,7 @@ prompt = no
 
 [ dn ]
 CN = $name
-O = Markdown
+O = Obsidian
 OU = Local Code Signing
 
 [ v3 ]

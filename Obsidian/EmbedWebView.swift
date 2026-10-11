@@ -53,9 +53,13 @@ final class CachedEmbedWebView: NSView {
     /// `forwardsScrollWheel` installs a per-card wheel monitor. Cards owned by
     /// `EditorLinkPreviewController` pass `false` because the controller
     /// already forwards wheel events for every card it hosts.
-    init(webView: WKWebView, loadTimeout: Duration = .seconds(20), forwardsScrollWheel: Bool = true) {
+    private let snapshotCache: EditorEmbedCache
+
+    init(webView: WKWebView, loadTimeout: Duration = .seconds(20), forwardsScrollWheel: Bool = true,
+         snapshotCache: EditorEmbedCache = .shared) {
         self.webView = webView
         self.loadTimeout = loadTimeout
+        self.snapshotCache = snapshotCache
         super.init(frame: .zero)
         addSubview(webView)
         if forwardsScrollWheel { scrollForwarder = EmbedScrollForwarder(host: self) }
@@ -231,10 +235,19 @@ final class CachedEmbedWebView: NSView {
         webView.configuration.userContentController.removeAllScriptMessageHandlers()
     }
 
+    private var showsSnapshotPlaceholder: Bool {
+        loadState == .loading && snapshotView.image != nil && !snapshotView.isHidden
+    }
+
+    /// Whether the "Loading embed…" or failure panel covers the card.
+    var isShowingStatusPanel: Bool { !statusView.isHidden }
+
     private func updateStatus() {
         statusBackgroundAlpha = 1
         applyStatusBackground()
-        statusView.isHidden = loadState == .ready || loadState == .idle
+        // A saved picture of this exact card stands in for it, uncovered,
+        // while the live embed loads; the panel returns only if loading fails.
+        statusView.isHidden = loadState == .ready || loadState == .idle || showsSnapshotPlaceholder
         webView.isHidden = loadState != .ready
         if case .failed(let message) = loadState {
             statusLabel.stringValue = message
@@ -270,15 +283,13 @@ final class CachedEmbedWebView: NSView {
         } else if loadState == .loading {
             let token = loadToken
             snapshotTask = Task { [weak self] in
-                let image = await EditorEmbedCache.shared.snapshot(for: key)
+                let image = await self?.snapshotCache.snapshot(for: key)
                 guard let self, !Task.isCancelled, self.loadToken == token,
                       self.snapshotKey == key, self.loadState == .loading else { return }
                 self.cachedSnapshotKey = image == nil ? nil : key
                 self.snapshotView.image = image
                 self.snapshotView.isHidden = image == nil
-                // Loading controls remain reachable even with a cached card.
-                self.statusBackgroundAlpha = image == nil ? 1 : 0.92
-                self.applyStatusBackground()
+                self.updateStatus()
             }
         }
     }
@@ -295,7 +306,7 @@ final class CachedEmbedWebView: NSView {
             self.webView.takeSnapshot(with: nil) { [weak self] image, _ in
                 guard let self, self.loadToken == token, self.snapshotKey == key,
                       self.loadState == .ready, let image else { return }
-                Task { await EditorEmbedCache.shared.saveSnapshot(image, for: key) }
+                Task { [snapshotCache = self.snapshotCache] in await snapshotCache.saveSnapshot(image, for: key) }
             }
         }
     }

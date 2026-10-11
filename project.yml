@@ -43,8 +43,7 @@ targets:
         product: Textual
     settings:
       base:
-        # Keep the installed app identity and its preferences.
-        PRODUCT_BUNDLE_IDENTIFIER: com.md.MarkdownEditor
+        PRODUCT_BUNDLE_IDENTIFIER: com.md.Obsidian
         MARKETING_VERSION: "1.0.2"
         CURRENT_PROJECT_VERSION: "3"
         CODE_SIGN_ENTITLEMENTS: Obsidian/Obsidian.entitlements
@@ -87,10 +86,10 @@ targets:
                 - markdown
                 - mdown
         UTExportedTypeDeclarations:
-          - UTTypeIdentifier: com.md.markdown.sidebar-drag-item
+          - UTTypeIdentifier: com.md.obsidian.sidebar-drag-item
             UTTypeConformsTo:
               - public.data
-            UTTypeDescription: Markdown Sidebar Drag Item
+            UTTypeDescription: Obsidian Sidebar Drag Item
   ObsidianTests:
     type: bundle.unit-test
     platform: macOS

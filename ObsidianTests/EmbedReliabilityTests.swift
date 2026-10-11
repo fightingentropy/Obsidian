@@ -259,11 +259,11 @@ final class EmbedReliabilityTests: XCTestCase {
 
     func testNavigationPolicyKeepsMainFrameOnAppOriginAndSubframesOnProviderHosts() throws {
         func url(_ string: String) throws -> URL { try XCTUnwrap(URL(string: string)) }
-        let origin = EmbedHTML.appOrigin(bundleIdentifier: "com.md.MarkdownEditor")
+        let origin = EmbedHTML.appOrigin(bundleIdentifier: "com.md.Obsidian")
         XCTAssertTrue(EmbedNavigationPolicy.allowsMainFrame(origin, appOrigin: origin))
         XCTAssertTrue(EmbedNavigationPolicy.allowsMainFrame(try url("about:blank"), appOrigin: origin))
         XCTAssertFalse(EmbedNavigationPolicy.allowsMainFrame(try url("https://x.com/user/status/1"), appOrigin: origin))
-        XCTAssertFalse(EmbedNavigationPolicy.allowsMainFrame(try url("http://com.md.markdowneditor/"), appOrigin: origin))
+        XCTAssertFalse(EmbedNavigationPolicy.allowsMainFrame(try url("http://com.md.obsidian/"), appOrigin: origin))
         XCTAssertFalse(EmbedNavigationPolicy.allowsMainFrame(try url("javascript:alert(1)"), appOrigin: origin))
 
         let xHosts = EmbedNavigationPolicy.subframeHosts(for: .xPost(username: "user", statusID: "1"))
@@ -281,7 +281,7 @@ final class EmbedReliabilityTests: XCTestCase {
 
     func testOnlyUserActivatedLinksAndClickPopupsLeaveTheCard() throws {
         func url(_ string: String) throws -> URL { try XCTUnwrap(URL(string: string)) }
-        let origin = EmbedHTML.appOrigin(bundleIdentifier: "com.md.MarkdownEditor")
+        let origin = EmbedHTML.appOrigin(bundleIdentifier: "com.md.Obsidian")
         let hosts = EmbedNavigationPolicy.subframeHosts(for: .youtube(videoID: "a"))
         func disposition(_ string: String, _ type: WKNavigationType, _ target: EmbedNavigationPolicy.Target) throws
             -> EmbedNavigationPolicy.Disposition {
@@ -313,8 +313,8 @@ final class EmbedReliabilityTests: XCTestCase {
     }
 
     func testYouTubeUsesApplicationIdentityAndDoesNotAutoplay() throws {
-        let origin = EmbedHTML.appOrigin(bundleIdentifier: "com.md.MarkdownEditor")
-        XCTAssertEqual(origin.absoluteString, "https://com.md.markdowneditor")
+        let origin = EmbedHTML.appOrigin(bundleIdentifier: "com.md.Obsidian")
+        XCTAssertEqual(origin.absoluteString, "https://com.md.obsidian")
         let url = try XCTUnwrap(YouTubeEmbedURL.url(videoID: "AVEZBy1uAk8", startSeconds: 123, origin: origin))
         let items = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems)
         XCTAssertEqual(items.first(where: { $0.name == "origin" })?.value, origin.absoluteString)
@@ -532,6 +532,39 @@ final class EmbedReliabilityTests: XCTestCase {
         XCTAssertNil(image)
         XCTAssertNil(loader.cachedImage(for: "AVEZBy1uAk8"))
         XCTAssertNil(YouTubeThumbnailLoader.decode(Data("not an image".utf8)))
+    }
+
+    func testSavedSnapshotShowsUncoveredWhileTheLiveEmbedLoads() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let suiteName = "EmbedSnapshotPlaceholder-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let cache = EditorEmbedCache(userDefaults: defaults, snapshotDirectoryURL: directory)
+        let container = CachedEmbedWebView(webView: WKWebView(), snapshotCache: cache)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 300), styleMask: [], backing: .buffered, defer: false)
+        window.contentView = container
+        defer { container.tearDown(); window.contentView = nil }
+        container.layoutSubtreeIfNeeded()
+        let key = EmbedSnapshotKey.make(content: "x-1-dark", width: container.bounds.width, scale: window.backingScaleFactor)
+        let picture = NSImage(size: NSSize(width: 20, height: 20), flipped: false) { rect in
+            NSColor.systemTeal.setFill()
+            rect.fill()
+            return true
+        }
+        await cache.saveSnapshot(picture, for: key)
+
+        container.configure(contentKey: "x-1-dark") { _ in }
+        for _ in 0..<200 where container.isShowingStatusPanel {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(container.loadState, .loading)
+        XCTAssertFalse(container.isShowingStatusPanel, "The saved card is not covered while the live embed loads")
+
+        container.fail("Couldn’t connect.")
+        XCTAssertTrue(container.isShowingStatusPanel, "A failed load still shows Retry and Open original")
     }
 
     // MARK: - Web view reuse

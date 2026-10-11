@@ -154,15 +154,14 @@ Use the local install script if you want the app in `/Applications` with stable 
 
 That script will:
 
-- create a local `Markdown` code-signing identity if needed
+- create a local `Obsidian` code-signing identity if needed
 - generate the Xcode project
 - build a local app
 - install a clean `/Applications/Obsidian.app`
-- back up the previous `Markdown.app` outside `/Applications`
 - launch it
 - blank the Sparkle feed and public key for that local build
 
-The project, scheme, and Swift module are named `Obsidian`. The app retains the `com.md.MarkdownEditor` bundle identifier and the local `Markdown` signing identity so existing vaults, preferences, and recovery drafts continue to work. Published releases retain their original archive filenames. The installer stops if `/Applications/Obsidian.app` belongs to a different application.
+The project, scheme, and Swift module are named `Obsidian`. The app's bundle identifier is `com.md.Obsidian`, and local installs are signed with a local `Obsidian` identity. The installer stops if `/Applications/Obsidian.app` belongs to a different application.
 
 The logo and app icon sources are documented in [branding](branding/README.md).
 
@@ -410,7 +409,7 @@ point them somewhere else.
 - If you need a non-default feed URL, set `SPARKLE_FEED_URL` when invoking the release script
 - Do not commit private keys to the repo
 - Use the same `SPARKLE_PRIVATE_KEY` for future releases if you want existing users to keep receiving Sparkle updates without a manual reinstall
-- Local `/Applications/Obsidian.app` installs should be signed with the local `Markdown` identity, not ad-hoc
+- Local `/Applications/Obsidian.app` installs should be signed with the local `Obsidian` identity, not ad-hoc
 - `./scripts/create_local_codesigning_identity.sh` imports that identity's private key so only `codesign` may use it (macOS may ask once; choose Always Allow) and trusts its certificate for code signing in your login keychain only, never system-wide
 
 ### Release Signing

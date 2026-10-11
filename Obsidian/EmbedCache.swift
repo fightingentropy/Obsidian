@@ -110,7 +110,7 @@ final class EditorEmbedCache {
         self.heights = storedHeights
         self.heightAccessOrder = storedHeights.keys.sorted()
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first ?? FileManager.default.temporaryDirectory
-        store = EmbedSnapshotStore(directory: snapshotDirectoryURL ?? base.appendingPathComponent("Markdown/EmbedSnapshots", isDirectory: true))
+        store = EmbedSnapshotStore(directory: snapshotDirectoryURL ?? base.appendingPathComponent("Obsidian/EmbedSnapshots", isDirectory: true))
         imageCache.countLimit = 24
         imageCache.totalCostLimit = 32 * 1_024 * 1_024
         Task { await store.prune() }

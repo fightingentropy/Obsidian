@@ -320,7 +320,7 @@ enum EmbedNavigationPolicy {
 
 enum EmbedHTML {
     static func appOrigin(bundleIdentifier: String? = Bundle.main.bundleIdentifier) -> URL {
-        URL(string: "https://\((bundleIdentifier ?? "com.md.MarkdownEditor").lowercased())")!
+        URL(string: "https://\((bundleIdentifier ?? "com.md.Obsidian").lowercased())")!
     }
 
     static func js(_ text: String) -> String {
@@ -607,7 +607,7 @@ final class YouTubeThumbnailLoader {
         configuration.urlCache = URLCache(
             memoryCapacity: 4 * 1_024 * 1_024,
             diskCapacity: 64 * 1_024 * 1_024,
-            directory: caches.appendingPathComponent("Markdown/YouTubeThumbnails", isDirectory: true)
+            directory: caches.appendingPathComponent("Obsidian/YouTubeThumbnails", isDirectory: true)
         )
         return URLSession(configuration: configuration)
     }()

@@ -9,7 +9,7 @@ enum Theme {
         return NSColor(srgbRed: 0.985, green: 0.982, blue: 0.975, alpha: 1)
     }
 
-    static let sidebarBackgroundColor = NSColor(name: NSColor.Name("MarkdownSidebarBackground")) { appearance in
+    static let sidebarBackgroundColor = NSColor(name: NSColor.Name("ObsidianSidebarBackground")) { appearance in
         if appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua {
             return NSColor(srgbRed: 0.072, green: 0.072, blue: 0.076, alpha: 1)
         }

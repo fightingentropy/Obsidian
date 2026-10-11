@@ -364,7 +364,7 @@ struct RecoveryStore: Sendable {
         let baseURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         return baseURL
-            .appendingPathComponent("com.md.MarkdownEditor", isDirectory: true)
+            .appendingPathComponent("com.md.Obsidian", isDirectory: true)
             .appendingPathComponent("Recovery", isDirectory: true)
     }
 }

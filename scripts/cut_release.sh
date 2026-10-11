@@ -67,8 +67,8 @@ function expected_marketing_version() {
 
 function sync_release_notes() {
   mkdir -p "$ARCHIVES_DIR"
-  rm -f "$ARCHIVES_DIR"/Markdown-*.md(N) "$ARCHIVES_DIR"/Obsidian-*.md(N)
-  for notes in "$ROOT_DIR"/releases/Markdown-*.md(N) "$ROOT_DIR"/releases/Obsidian-*.md(N); do
+  rm -f "$ARCHIVES_DIR"/Obsidian-*.md(N)
+  for notes in "$ROOT_DIR"/releases/Obsidian-*.md(N); do
     cp "$notes" "$ARCHIVES_DIR/"
   done
 }
@@ -243,7 +243,7 @@ if [[ -z "$SPARKLE_KEY_ACCOUNT" ]]; then
   if [[ -n "$REPO" ]]; then
     SPARKLE_KEY_ACCOUNT="${REPO##*/}-sparkle"
   else
-    SPARKLE_KEY_ACCOUNT="markdown-sparkle"
+    SPARKLE_KEY_ACCOUNT="obsidian-sparkle"
   fi
 fi
 
@@ -285,7 +285,7 @@ if [[ -z "$SPARKLE_BIN_DIR" ]]; then
   exit 1
 fi
 
-SPARKLE_PRIVATE_KEY_FILE="$(mktemp "${TMPDIR:-/tmp}/markdown-sparkle-key.XXXXXX")"
+SPARKLE_PRIVATE_KEY_FILE="$(mktemp "${TMPDIR:-/tmp}/obsidian-sparkle-key.XXXXXX")"
 cleanup() {
   rm -f "$SPARKLE_PRIVATE_KEY_FILE"
 }

@@ -1,4 +1,4 @@
-## Markdown 1.0.1
+## Obsidian 1.0.1
 
 - Added a full assistant settings page with model selection for GLM 5, Kimi K2.5, and MiniMax M2.5.
 - Added launcher appearance controls and a live preview for the floating assistant button.

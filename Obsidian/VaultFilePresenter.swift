@@ -74,7 +74,7 @@ final class VaultFilePresenter: NSObject, NSFilePresenter, @unchecked Sendable {
         self.presentedItemURL = vaultURL.standardizedFileURL
         self.onChange = onChange
         let queue = OperationQueue()
-        queue.name = "com.md.MarkdownEditor.file-presenter"
+        queue.name = "com.md.obsidian.file-presenter"
         queue.maxConcurrentOperationCount = 1
         self.presentedItemOperationQueue = queue
         super.init()

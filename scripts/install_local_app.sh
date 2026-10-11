@@ -7,9 +7,8 @@ LOCAL_BUILD_ROOT="$ROOT_DIR/.codex-build/local-install"
 LOCAL_DERIVED_DATA="$LOCAL_BUILD_ROOT/deriveddata"
 LOCAL_SPM_DIR="$LOCAL_BUILD_ROOT/spm"
 INSTALL_APP_PATH="/Applications/Obsidian.app"
-LEGACY_INSTALL_APP_PATH="/Applications/Markdown.app"
-APP_BUNDLE_IDENTIFIER="com.md.MarkdownEditor"
-LOCAL_CODESIGN_IDENTITY="${LOCAL_CODESIGN_IDENTITY:-Markdown}"
+APP_BUNDLE_IDENTIFIER="com.md.Obsidian"
+LOCAL_CODESIGN_IDENTITY="${LOCAL_CODESIGN_IDENTITY:-Obsidian}"
 
 function require_tool() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -61,18 +60,18 @@ fi
 
 # Ask the existing app to quit so it can save pending note edits.
 osascript <<'APPLESCRIPT'
-if application id "com.md.MarkdownEditor" is running then
-  tell application id "com.md.MarkdownEditor" to quit
+if application id "com.md.Obsidian" is running then
+  tell application id "com.md.Obsidian" to quit
 end if
 APPLESCRIPT
 
 for attempt in {1..80}; do
-  if ! pgrep -f '/Applications/(Markdown|Obsidian)\.app/Contents/MacOS/(Markdown|Obsidian)( |$)' >/dev/null; then
+  if ! pgrep -f '/Applications/Obsidian\.app/Contents/MacOS/Obsidian( |$)' >/dev/null; then
     break
   fi
   sleep 0.25
 done
-if pgrep -f '/Applications/(Markdown|Obsidian)\.app/Contents/MacOS/(Markdown|Obsidian)( |$)' >/dev/null; then
+if pgrep -f '/Applications/Obsidian\.app/Contents/MacOS/Obsidian( |$)' >/dev/null; then
   echo "The app is still running; installation stopped to preserve pending edits." >&2
   exit 1
 fi
@@ -80,16 +79,6 @@ fi
 rm -rf "$INSTALL_APP_PATH"
 ditto "$APP_PATH" "$INSTALL_APP_PATH"
 xattr -cr "$INSTALL_APP_PATH"
-
-# Keep the previous Markdown install as a backup outside /Applications.
-if [[ -d "$LEGACY_INSTALL_APP_PATH" ]]; then
-  legacy_identifier=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$LEGACY_INSTALL_APP_PATH/Contents/Info.plist" 2>/dev/null || true)
-  if [[ "$legacy_identifier" == "$APP_BUNDLE_IDENTIFIER" ]]; then
-    BACKUP_DIR="$ROOT_DIR/.codex-build/previous-apps/$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$BACKUP_DIR"
-    mv "$LEGACY_INSTALL_APP_PATH" "$BACKUP_DIR/Markdown.app"
-  fi
-fi
 
 open -na "$INSTALL_APP_PATH"
 

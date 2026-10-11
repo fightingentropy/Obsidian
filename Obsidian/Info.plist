@@ -55,9 +55,9 @@
 				<string>public.data</string>
 			</array>
 			<key>UTTypeDescription</key>
-			<string>Markdown Sidebar Drag Item</string>
+			<string>Obsidian Sidebar Drag Item</string>
 			<key>UTTypeIdentifier</key>
-			<string>com.md.markdown.sidebar-drag-item</string>
+			<string>com.md.obsidian.sidebar-drag-item</string>
 		</dict>
 	</array>
 	<key>UTImportedTypeDeclarations</key>

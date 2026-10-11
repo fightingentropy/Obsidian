@@ -49,7 +49,7 @@ struct SidebarDragItem: Codable, Transferable {
 }
 
 extension UTType {
-    static let sidebarDragItem = UTType(exportedAs: "com.md.markdown.sidebar-drag-item")
+    static let sidebarDragItem = UTType(exportedAs: "com.md.obsidian.sidebar-drag-item")
 }
 
 enum SidebarDropSupport {
