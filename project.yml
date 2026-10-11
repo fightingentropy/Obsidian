@@ -9,6 +9,8 @@ options:
 
 settings:
   base:
+    # Swift 6 language mode already enables complete strict concurrency
+    # checking (as errors), so SWIFT_STRICT_CONCURRENCY is not set separately.
     SWIFT_VERSION: "6.0"
 
 packages:
@@ -49,19 +51,18 @@ targets:
         CODE_SIGN_STYLE: Automatic
         PRODUCT_NAME: Obsidian
         PRODUCT_MODULE_NAME: Obsidian
-        INFOPLIST_KEY_CFBundleDisplayName: Obsidian
-        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.productivity
+        # The target ships the tracked Obsidian/Info.plist below, so
+        # INFOPLIST_KEY_* build settings are ignored; put Info.plist keys in
+        # info.properties instead.
         SPARKLE_FEED_URL: ""
         SPARKLE_PUBLIC_ED_KEY: ""
-        INFOPLIST_KEY_SUFeedURL: "$(SPARKLE_FEED_URL)"
-        INFOPLIST_KEY_SUPublicEDKey: "$(SPARKLE_PUBLIC_ED_KEY)"
-        SWIFT_STRICT_CONCURRENCY: complete
     info:
       path: Obsidian/Info.plist
       properties:
         CFBundleDisplayName: "$(PRODUCT_NAME)"
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        LSApplicationCategoryType: public.app-category.productivity
         SUFeedURL: "$(SPARKLE_FEED_URL)"
         SUPublicEDKey: "$(SPARKLE_PUBLIC_ED_KEY)"
         CFBundleDocumentTypes:

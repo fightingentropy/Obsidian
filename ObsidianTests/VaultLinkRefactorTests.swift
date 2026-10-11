@@ -168,4 +168,62 @@ final class VaultLinkRefactorTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: firstURL, encoding: .utf8), "first external after refactor")
         XCTAssertEqual(try String(contentsOf: secondURL, encoding: .utf8), "second external")
     }
+
+    func testWikiAndMarkdownLinksAreRewrittenTogetherAroundCode() throws {
+        let vault = URL(fileURLWithPath: "/Vault", isDirectory: true)
+        let old = vault.appendingPathComponent("Old.md")
+        let new = vault.appendingPathComponent("New.md")
+        let source = vault.appendingPathComponent("Index.md")
+        let body = "[[Old]] `[[Old]]` [note](Old.md) ![[Old.md]] `[x](Old.md)`"
+
+        let edits = VaultLinkRefactor.edits(
+            notes: [
+                VaultLinkNoteSnapshot(url: old, body: "# Old", aliases: []),
+                VaultLinkNoteSnapshot(url: source, body: body, aliases: []),
+            ],
+            moving: old,
+            to: new,
+            sourceIsDirectory: false,
+            vaultURL: vault
+        )
+
+        XCTAssertEqual(
+            try XCTUnwrap(edits.first(where: { $0.originalURL == source })).updatedBody,
+            "[[New]] `[[Old]]` [note](New.md) ![[New.md]] `[x](Old.md)`"
+        )
+    }
+
+    func testRenameRewritesLinksAfterMultiUnitCodeAndInCRLFNotes() throws {
+        let vault = URL(fileURLWithPath: "/Vault", isDirectory: true)
+        let old = vault.appendingPathComponent("Old.md")
+        let new = vault.appendingPathComponent("New.md")
+        let emojiSource = vault.appendingPathComponent("Emoji.md")
+        let crlfSource = vault.appendingPathComponent("Windows.md")
+
+        let edits = VaultLinkRefactor.edits(
+            notes: [
+                VaultLinkNoteSnapshot(url: old, body: "# Old", aliases: []),
+                // Each masked emoji or combining sequence is one Character but
+                // two UTF-16 code units; masking it with a single space shifted
+                // every later range read back out of the body.
+                VaultLinkNoteSnapshot(url: emojiSource, body: "`👍 e\u{301}` [[Old]] [note](Old.md)", aliases: []),
+                // "\r\n" is one Character, so a CRLF note was never split into
+                // lines and its opening fence masked the whole note.
+                VaultLinkNoteSnapshot(url: crlfSource, body: "```\r\n[[Old]]\r\n```\r\nSee [[Old]].\r\n", aliases: []),
+            ],
+            moving: old,
+            to: new,
+            sourceIsDirectory: false,
+            vaultURL: vault
+        )
+
+        XCTAssertEqual(
+            try XCTUnwrap(edits.first(where: { $0.originalURL == emojiSource })).updatedBody,
+            "`👍 e\u{301}` [[New]] [note](New.md)"
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(edits.first(where: { $0.originalURL == crlfSource })).updatedBody,
+            "```\r\n[[Old]]\r\n```\r\nSee [[New]].\r\n"
+        )
+    }
 }

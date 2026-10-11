@@ -68,14 +68,16 @@ struct NoteGraphSnapshot: Sendable, Equatable {
             }
         }
 
-        let sortedNodes = nodes.sorted { lhs, rhs in
-            if lhs.degree != rhs.degree {
-                return lhs.degree > rhs.degree
+        // Filter down to the (typically small) neighbourhood before sorting so
+        // the cost scales with the node's degree rather than the whole graph.
+        return nodes
+            .filter { relatedIDs.contains($0.id) }
+            .sorted { lhs, rhs in
+                if lhs.degree != rhs.degree {
+                    return lhs.degree > rhs.degree
+                }
+                return lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
             }
-            return lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
-        }
-
-        return sortedNodes.filter { relatedIDs.contains($0.id) }
     }
 }
 
@@ -447,22 +449,27 @@ enum MarkdownNoteLinkExtractor {
         return (descriptor.destination, displayName)
     }
 
-    /// Masks fenced and inline code with spaces of equal length so link
-    /// scanners can skip examples without shifting character ranges.
+    /// Masks fenced and inline code with spaces so link scanners can skip
+    /// examples without shifting ranges. Every masked `Character` becomes one
+    /// space per UTF-16 code unit and line terminators are copied verbatim,
+    /// so the result always has the same `NSString` length as `markdown` and
+    /// an `NSRange` found in it indexes `markdown` directly.
     static func maskingCodeRegions(_ markdown: String) -> String {
         sanitizedMarkdown(markdown)
     }
 
     private static func sanitizedMarkdown(_ markdown: String) -> String {
-        let lines = markdown.split(
-            separator: "\n",
-            omittingEmptySubsequences: false
-        )
-        var sanitizedLines: [String] = []
+        var sanitized = ""
+        // Masking never adds UTF-8 bytes, so this is an upper bound.
+        sanitized.reserveCapacity(markdown.utf8.count)
         var activeFence: FenceDescriptor?
+        var lineStart = markdown.startIndex
 
-        for line in lines {
-            let lineString = String(line)
+        while lineStart < markdown.endIndex {
+            // Any newline Character ends a line. "\r\n" is one Character, so
+            // splitting on "\n" alone never split CRLF notes into lines.
+            let lineEnd = markdown[lineStart...].firstIndex(where: { $0.isNewline }) ?? markdown.endIndex
+            let lineString = String(markdown[lineStart..<lineEnd])
             let trimmed = lineString.trimmingLeadingWhitespace()
 
             if let fence = fenceDescriptor(in: trimmed) {
@@ -474,36 +481,39 @@ enum MarkdownNoteLinkExtractor {
                     activeFence = fence
                 }
 
-                sanitizedLines.append(String(repeating: " ", count: lineString.count))
-                continue
+                sanitized += maskedSpaces(utf16Length: lineString.utf16.count)
+            } else if activeFence != nil {
+                sanitized += maskedSpaces(utf16Length: lineString.utf16.count)
+            } else {
+                sanitized += maskInlineCode(in: lineString)
             }
 
-            if activeFence != nil {
-                sanitizedLines.append(String(repeating: " ", count: lineString.count))
-                continue
-            }
-
-            sanitizedLines.append(maskInlineCode(in: lineString))
+            guard lineEnd < markdown.endIndex else { break }
+            sanitized.append(markdown[lineEnd])
+            lineStart = markdown.index(after: lineEnd)
         }
 
-        return sanitizedLines.joined(separator: "\n")
+        return sanitized
     }
 
     private static func maskInlineCode(in line: String) -> String {
         let characters = Array(line)
         var result = ""
+        result.reserveCapacity(line.utf8.count)
         var index = 0
         var activeFenceLength: Int?
 
         while index < characters.count {
             if characters[index] == "`" {
                 let runStart = index
+                var runUTF16Length = 0
                 while index < characters.count, characters[index] == "`" {
+                    runUTF16Length += characters[index].utf16.count
                     index += 1
                 }
 
                 let fenceLength = index - runStart
-                result += String(repeating: " ", count: fenceLength)
+                result += maskedSpaces(utf16Length: runUTF16Length)
 
                 if activeFenceLength == fenceLength {
                     activeFenceLength = nil
@@ -517,13 +527,20 @@ enum MarkdownNoteLinkExtractor {
             if activeFenceLength == nil {
                 result.append(characters[index])
             } else {
-                result.append(" ")
+                // An emoji or combining sequence is one Character but several
+                // UTF-16 code units; pad all of them.
+                result += maskedSpaces(utf16Length: characters[index].utf16.count)
             }
 
             index += 1
         }
 
         return result
+    }
+
+    /// Spaces standing in for masked text of `utf16Length` UTF-16 code units.
+    private static func maskedSpaces(utf16Length: Int) -> String {
+        String(repeating: " ", count: utf16Length)
     }
 
     private static func fenceDescriptor(in trimmedLine: String) -> FenceDescriptor? {
@@ -949,6 +966,28 @@ enum NoteGraphBuilder {
 }
 
 enum NoteGraphLayoutEngine {
+    /// How the n-body repulsion term of the force simulation is evaluated.
+    enum RepulsionStrategy: Equatable, Sendable {
+        /// Every pair of nodes is visited: O(n²) per iteration, exact.
+        case exact
+        /// Barnes-Hut quadtree approximation: O(n log n) per iteration.
+        case barnesHut
+    }
+
+    /// Graphs with more nodes than this use the Barnes-Hut approximation for
+    /// repulsion; smaller graphs keep the exact all-pairs computation so their
+    /// layouts are unchanged.
+    static let barnesHutNodeThreshold = 300
+
+    /// Barnes-Hut opening angle. A quadtree cell is treated as a single point
+    /// mass when its width divided by its distance from the body is below this.
+    static let barnesHutTheta: CGFloat = 0.8
+
+    /// The repulsion strategy the engine uses for a graph of `nodeCount` nodes.
+    static func repulsionStrategy(forNodeCount nodeCount: Int) -> RepulsionStrategy {
+        nodeCount > barnesHutNodeThreshold ? .barnesHut : .exact
+    }
+
     static func generate(for snapshot: NoteGraphSnapshot, relayoutSeed: Int) -> NoteGraphLayout {
         generatedLayouts(
             for: snapshot,
@@ -1018,25 +1057,51 @@ enum NoteGraphLayoutEngine {
         let selectedComponentIndex = pinnedNodeID.flatMap { componentByNode[$0] }
         let frameStride = 5
         var sampledPositions: [[CGPoint]] = capturesMotion ? [positions] : []
+        let strategy = repulsionStrategy(forNodeCount: nodes.count)
+        // The tree is only populated on the approximate path; keep the exact
+        // path's allocation at its minimum.
+        var quadtree = RepulsionQuadtree(bodyCount: strategy == .barnesHut ? nodes.count : 0)
 
         for iteration in 0..<220 {
             var displacement = Array(repeating: CGVector.zero, count: nodes.count)
 
-            for firstIndex in nodes.indices {
-                for secondIndex in nodes.indices where secondIndex > firstIndex {
-                    let deltaX = positions[firstIndex].x - positions[secondIndex].x
-                    let deltaY = positions[firstIndex].y - positions[secondIndex].y
-                    let distance = max(0.045, hypot(deltaX, deltaY))
-                    let sameComponent = componentByNode[nodes[firstIndex].id] == componentByNode[nodes[secondIndex].id]
-                    let repulsion = sameComponent ? 0.016 / (distance * distance) : 0.009 / (distance * distance)
-                    let directionX = deltaX / distance
-                    let directionY = deltaY / distance
-                    let vector = CGVector(dx: directionX * repulsion, dy: directionY * repulsion)
-                    displacement[firstIndex].dx += vector.dx
-                    displacement[firstIndex].dy += vector.dy
-                    displacement[secondIndex].dx -= vector.dx
-                    displacement[secondIndex].dy -= vector.dy
+            switch strategy {
+            case .exact:
+                for firstIndex in nodes.indices {
+                    for secondIndex in nodes.indices where secondIndex > firstIndex {
+                        let deltaX = positions[firstIndex].x - positions[secondIndex].x
+                        let deltaY = positions[firstIndex].y - positions[secondIndex].y
+                        let distance = max(0.045, hypot(deltaX, deltaY))
+                        let sameComponent = componentByNode[nodes[firstIndex].id] == componentByNode[nodes[secondIndex].id]
+                        let repulsion = sameComponent ? 0.016 / (distance * distance) : 0.009 / (distance * distance)
+                        let directionX = deltaX / distance
+                        let directionY = deltaY / distance
+                        let vector = CGVector(dx: directionX * repulsion, dy: directionY * repulsion)
+                        displacement[firstIndex].dx += vector.dx
+                        displacement[firstIndex].dy += vector.dy
+                        displacement[secondIndex].dx -= vector.dx
+                        displacement[secondIndex].dy -= vector.dy
+                    }
                 }
+
+            case .barnesHut:
+                // Component weighting: the exact path repels nodes from *different*
+                // components slightly less (0.009 vs 0.016) so clusters sit closer
+                // together. A quadtree cell aggregates nodes from many components,
+                // so a per-pair factor is not available here. Rather than building
+                // one tree per component plus a global tree (twice the traversals,
+                // and vaults have many singleton components), the approximate path
+                // uses the same-component constant for every pair: at this node
+                // count the component anchors and edge springs dominate the
+                // arrangement, and the difference is within the approximation error.
+                quadtree.rebuild(with: positions)
+                quadtree.accumulateRepulsion(
+                    into: &displacement,
+                    positions: positions,
+                    strength: 0.016,
+                    minimumDistance: 0.045,
+                    theta: barnesHutTheta
+                )
             }
 
             for edge in snapshot.edges {
@@ -1135,7 +1200,14 @@ enum NoteGraphLayoutEngine {
             return nil
         }
 
-        let positions = nodes.map { existing.positions[$0.id] ?? .zero }
+        // Translate so the newly selected node becomes the origin. `normalized`
+        // only forces the pinned node to (0, 0); without the translation the
+        // previously pinned node (already at the origin) would land on top of it.
+        let origin = snapshot.selectedNodeID.flatMap { existing.positions[$0] } ?? .zero
+        let positions = nodes.map { node -> CGPoint in
+            let point = existing.positions[node.id] ?? .zero
+            return CGPoint(x: point.x - origin.x, y: point.y - origin.y)
+        }
         let normalizedPositions = normalized(
             positions,
             pinnedNodeID: snapshot.selectedNodeID,
@@ -1240,24 +1312,41 @@ enum NoteGraphLayoutEngine {
         var velocities = Array(repeating: CGVector.zero, count: nodes.count)
         var temperature: CGFloat = 0.075
         let maxRadius: CGFloat = 2.1
+        let strategy = repulsionStrategy(forNodeCount: nodes.count)
+        // The tree is only populated on the approximate path; keep the exact
+        // path's allocation at its minimum.
+        var quadtree = RepulsionQuadtree(bodyCount: strategy == .barnesHut ? nodes.count : 0)
 
         for _ in 0..<140 {
             var displacement = Array(repeating: CGVector.zero, count: nodes.count)
 
-            for firstIndex in nodes.indices {
-                for secondIndex in nodes.indices where secondIndex > firstIndex {
-                    let deltaX = positions[firstIndex].x - positions[secondIndex].x
-                    let deltaY = positions[firstIndex].y - positions[secondIndex].y
-                    let distance = max(0.05, hypot(deltaX, deltaY))
-                    let repulsion = 0.02 / (distance * distance)
-                    let directionX = deltaX / distance
-                    let directionY = deltaY / distance
-                    let vector = CGVector(dx: directionX * repulsion, dy: directionY * repulsion)
-                    displacement[firstIndex].dx += vector.dx
-                    displacement[firstIndex].dy += vector.dy
-                    displacement[secondIndex].dx -= vector.dx
-                    displacement[secondIndex].dy -= vector.dy
+            switch strategy {
+            case .exact:
+                for firstIndex in nodes.indices {
+                    for secondIndex in nodes.indices where secondIndex > firstIndex {
+                        let deltaX = positions[firstIndex].x - positions[secondIndex].x
+                        let deltaY = positions[firstIndex].y - positions[secondIndex].y
+                        let distance = max(0.05, hypot(deltaX, deltaY))
+                        let repulsion = 0.02 / (distance * distance)
+                        let directionX = deltaX / distance
+                        let directionY = deltaY / distance
+                        let vector = CGVector(dx: directionX * repulsion, dy: directionY * repulsion)
+                        displacement[firstIndex].dx += vector.dx
+                        displacement[firstIndex].dy += vector.dy
+                        displacement[secondIndex].dx -= vector.dx
+                        displacement[secondIndex].dy -= vector.dy
+                    }
                 }
+
+            case .barnesHut:
+                quadtree.rebuild(with: positions)
+                quadtree.accumulateRepulsion(
+                    into: &displacement,
+                    positions: positions,
+                    strength: 0.02,
+                    minimumDistance: 0.05,
+                    theta: barnesHutTheta
+                )
             }
 
             for index in nodes.indices {
@@ -1371,6 +1460,200 @@ enum NoteGraphLayoutEngine {
 
         let normalized = Double(hash % 10_000) / 10_000
         return CGFloat(normalized)
+    }
+}
+
+/// Barnes-Hut quadtree used to approximate n-body repulsion in O(n log n).
+///
+/// Cells live in one flat array; an internal cell's four children are stored
+/// contiguously starting at `firstChild`. The tree is rebuilt from scratch each
+/// simulation step (reusing the array storage). Bodies are inserted in index
+/// order and children are visited in a fixed order, so for a given set of
+/// positions the tree, the traversal and therefore the accumulated forces are
+/// fully deterministic — no randomness or hashing order is involved.
+private struct RepulsionQuadtree {
+    private struct Cell {
+        var centerX: CGFloat
+        var centerY: CGFloat
+        var halfSize: CGFloat
+        /// Number of bodies in this cell's subtree.
+        var mass: CGFloat = 0
+        /// Sum of the positions of the bodies in this subtree (centre of mass × mass).
+        var sumX: CGFloat = 0
+        var sumY: CGFloat = 0
+        /// Index of the first of four contiguous child cells, or -1 for a leaf.
+        var firstChild: Int = -1
+        /// Body stored in this leaf, or -1 when the leaf is empty.
+        var body: Int = -1
+    }
+
+    /// Subdivision stops at this depth; bodies that still share a cell there are
+    /// treated as coincident and kept together in a single multi-body leaf.
+    private static let maximumDepth = 32
+
+    private var cells: [Cell] = []
+    private var traversalStack: [Int] = []
+
+    init(bodyCount: Int) {
+        cells.reserveCapacity(max(bodyCount * 2, 16))
+        traversalStack.reserveCapacity(64)
+    }
+
+    mutating func rebuild(with positions: [CGPoint]) {
+        cells.removeAll(keepingCapacity: true)
+        guard let first = positions.first else { return }
+
+        var minX = first.x
+        var maxX = first.x
+        var minY = first.y
+        var maxY = first.y
+        for point in positions.dropFirst() {
+            minX = min(minX, point.x)
+            maxX = max(maxX, point.x)
+            minY = min(minY, point.y)
+            maxY = max(maxY, point.y)
+        }
+
+        // Pad the root slightly so bodies on the bounding box are strictly inside.
+        let halfSize = max(maxX - minX, maxY - minY) / 2 + 0.001
+        cells.append(Cell(
+            centerX: (minX + maxX) / 2,
+            centerY: (minY + maxY) / 2,
+            halfSize: halfSize
+        ))
+
+        for (body, point) in positions.enumerated() {
+            insert(body: body, at: point, positions: positions)
+        }
+    }
+
+    /// Adds the repulsion every other body exerts on each body to `displacement`.
+    ///
+    /// Matches the exact path's force law: `strength / distance²` along the
+    /// separation vector, with the distance clamped to `minimumDistance`.
+    mutating func accumulateRepulsion(
+        into displacement: inout [CGVector],
+        positions: [CGPoint],
+        strength: CGFloat,
+        minimumDistance: CGFloat,
+        theta: CGFloat
+    ) {
+        guard !cells.isEmpty else { return }
+
+        for body in positions.indices {
+            let point = positions[body]
+            var forceX: CGFloat = 0
+            var forceY: CGFloat = 0
+
+            traversalStack.removeAll(keepingCapacity: true)
+            traversalStack.append(0)
+
+            while let cellIndex = traversalStack.popLast() {
+                let cell = cells[cellIndex]
+                guard cell.mass > 0 else { continue }
+
+                let isLeaf = cell.firstChild < 0
+                if isLeaf, cell.mass == 1, cell.body == body {
+                    // A body does not repel itself.
+                    continue
+                }
+
+                let centerOfMassX = cell.sumX / cell.mass
+                let centerOfMassY = cell.sumY / cell.mass
+                let deltaX = point.x - centerOfMassX
+                let deltaY = point.y - centerOfMassY
+                let distance = max(minimumDistance, hypot(deltaX, deltaY))
+
+                if !isLeaf, (cell.halfSize * 2) / distance >= theta {
+                    // Too close to approximate: descend. Push in reverse so the
+                    // children pop in index order, keeping floating-point
+                    // accumulation order stable between runs.
+                    var offset = 3
+                    while offset >= 0 {
+                        traversalStack.append(cell.firstChild + offset)
+                        offset -= 1
+                    }
+                    continue
+                }
+
+                // Either a distant cell treated as one point mass, or a leaf
+                // holding another body (or coincident bodies, whose combined
+                // centre of mass sits on top of `point` and contributes ~0).
+                let repulsion = strength * cell.mass / (distance * distance)
+                forceX += (deltaX / distance) * repulsion
+                forceY += (deltaY / distance) * repulsion
+            }
+
+            displacement[body].dx += forceX
+            displacement[body].dy += forceY
+        }
+    }
+
+    private mutating func insert(body: Int, at point: CGPoint, positions: [CGPoint]) {
+        var cellIndex = 0
+        var depth = 0
+
+        while true {
+            cells[cellIndex].mass += 1
+            cells[cellIndex].sumX += point.x
+            cells[cellIndex].sumY += point.y
+
+            let firstChild = cells[cellIndex].firstChild
+            if firstChild >= 0 {
+                cellIndex = firstChild + quadrant(of: point, in: cells[cellIndex])
+                depth += 1
+                continue
+            }
+
+            if cells[cellIndex].body < 0 {
+                // Empty leaf: claim it.
+                cells[cellIndex].body = body
+                return
+            }
+
+            if depth >= Self.maximumDepth {
+                // Coincident bodies share this leaf. Only the first is recorded
+                // in `body`; the aggregate mass and centre of mass cover the rest.
+                return
+            }
+
+            // Occupied leaf: subdivide and push the existing body down one level,
+            // then keep descending with the new body.
+            let existing = cells[cellIndex].body
+            let existingPoint = positions[existing]
+            cells[cellIndex].body = -1
+            cells[cellIndex].firstChild = cells.count
+            appendChildren(of: cellIndex)
+
+            let existingChild = cells[cellIndex].firstChild + quadrant(of: existingPoint, in: cells[cellIndex])
+            cells[existingChild].mass = 1
+            cells[existingChild].sumX = existingPoint.x
+            cells[existingChild].sumY = existingPoint.y
+            cells[existingChild].body = existing
+
+            cellIndex = cells[cellIndex].firstChild + quadrant(of: point, in: cells[cellIndex])
+            depth += 1
+        }
+    }
+
+    private mutating func appendChildren(of cellIndex: Int) {
+        let parent = cells[cellIndex]
+        let childHalfSize = parent.halfSize / 2
+
+        for quadrant in 0..<4 {
+            let offsetX = (quadrant & 1) == 0 ? -childHalfSize : childHalfSize
+            let offsetY = (quadrant & 2) == 0 ? -childHalfSize : childHalfSize
+            cells.append(Cell(
+                centerX: parent.centerX + offsetX,
+                centerY: parent.centerY + offsetY,
+                halfSize: childHalfSize
+            ))
+        }
+    }
+
+    /// Quadrant index of `point` within `cell`: bit 0 is east, bit 1 is south.
+    private func quadrant(of point: CGPoint, in cell: Cell) -> Int {
+        (point.x >= cell.centerX ? 1 : 0) + (point.y >= cell.centerY ? 2 : 0)
     }
 }
 

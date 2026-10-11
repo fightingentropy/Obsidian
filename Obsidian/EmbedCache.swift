@@ -2,16 +2,36 @@ import AppKit
 import ImageIO
 import UniformTypeIdentifiers
 
-/// PNG encoding, decoding and disk maintenance never run on the UI thread.
+/// PNG decoding and disk maintenance never run on the UI thread, and encoding
+/// happens before a save enters the actor so reads never wait behind it.
 actor EmbedSnapshotStore {
     let directory: URL
     let byteLimit: Int
     let maximumAge: TimeInterval
+    /// A directory scan only pays off once this many new bytes could have
+    /// pushed the cache over budget.
+    let pruneThreshold: Int
+    private var bytesWrittenSincePrune = 0
+    private var hasPruned = false
 
-    init(directory: URL, byteLimit: Int = 64 * 1_024 * 1_024, maximumAge: TimeInterval = 7 * 24 * 3600) {
+    init(directory: URL, byteLimit: Int = 64 * 1_024 * 1_024, maximumAge: TimeInterval = 7 * 24 * 3600,
+         pruneThreshold: Int = 8 * 1_024 * 1_024) {
         self.directory = directory
         self.byteLimit = max(0, byteLimit)
         self.maximumAge = maximumAge
+        self.pruneThreshold = max(0, pruneThreshold)
+    }
+
+    /// Pure CPU work with no actor state, so callers encode on the cooperative
+    /// pool and hand the actor only the finished bytes.
+    nonisolated static func pngData(for image: CGImage) -> Data? {
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil) else {
+            return nil
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return data as Data
     }
 
     func image(for key: String) -> CGImage? {
@@ -26,17 +46,16 @@ actor EmbedSnapshotStore {
         return CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
     }
 
-    func save(_ image: CGImage, for key: String) {
-        let data = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil) else { return }
-        CGImageDestinationAddImage(destination, image, nil)
-        guard CGImageDestinationFinalize(destination) else { return }
+    func save(_ data: Data, for key: String) {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try? (data as Data).write(to: fileURL(for: key), options: .atomic)
-        prune()
+        guard (try? data.write(to: fileURL(for: key), options: .atomic)) != nil else { return }
+        bytesWrittenSincePrune += data.count
+        if !hasPruned || bytesWrittenSincePrune >= pruneThreshold { prune() }
     }
 
     func prune() {
+        hasPruned = true
+        bytesWrittenSincePrune = 0
         let keys: Set<URLResourceKey> = [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]
         let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: Array(keys))) ?? []
         let entries = files.compactMap { url -> (URL, Date, Int)? in
@@ -69,17 +88,27 @@ enum EmbedSnapshotKey {
 
 @MainActor
 final class EditorEmbedCache {
-    static let shared = EditorEmbedCache()
+    static let shared: EditorEmbedCache = {
+        let cache = EditorEmbedCache()
+        cache.observeApplicationLifecycle()
+        return cache
+    }()
+    private static let heightLimit = 512
     private let userDefaults: UserDefaults
     private let heightStorageKey: String
     private var heights: [String: Double]
+    /// Oldest first; a key moves to the end whenever its height changes.
+    private var heightAccessOrder: [String]
+    private var pendingHeightWrite: Task<Void, Never>?
     private let imageCache = NSCache<NSString, NSImage>()
     private let store: EmbedSnapshotStore
 
     init(userDefaults: UserDefaults = .standard, heightStorageKey: String = "editorEmbedCache.xHeights.v2", snapshotDirectoryURL: URL? = nil) {
         self.userDefaults = userDefaults
         self.heightStorageKey = heightStorageKey
-        self.heights = userDefaults.dictionary(forKey: heightStorageKey) as? [String: Double] ?? [:]
+        let storedHeights = userDefaults.dictionary(forKey: heightStorageKey) as? [String: Double] ?? [:]
+        self.heights = storedHeights
+        self.heightAccessOrder = storedHeights.keys.sorted()
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first ?? FileManager.default.temporaryDirectory
         store = EmbedSnapshotStore(directory: snapshotDirectoryURL ?? base.appendingPathComponent("Markdown/EmbedSnapshots", isDirectory: true))
         imageCache.countLimit = 24
@@ -95,12 +124,50 @@ final class EditorEmbedCache {
     func saveXHeight(_ height: CGFloat, for statusID: String, width: CGFloat = 550) {
         guard height.isFinite, height > 0 else { return }
         let key = heightKey(statusID, width)
-        guard heights[key] != Double(height) else { return }
-        if heights[key] == nil, heights.count >= 512, let oldest = heights.keys.sorted().first {
-            heights.removeValue(forKey: oldest)
+        let value = Double(height)
+        guard heights[key] != value else { return }
+        heights[key] = value
+        heightAccessOrder.removeAll { $0 == key }
+        heightAccessOrder.append(key)
+        while heightAccessOrder.count > Self.heightLimit {
+            heights.removeValue(forKey: heightAccessOrder.removeFirst())
         }
-        heights[key] = Double(height)
+        scheduleHeightPersistence()
+    }
+
+    /// Persists coalesced height changes now instead of after the debounce.
+    func flushPendingHeightWrites() {
+        guard let pendingHeightWrite else { return }
+        pendingHeightWrite.cancel()
+        self.pendingHeightWrite = nil
         userDefaults.set(heights, forKey: heightStorageKey)
+    }
+
+    /// The debounce must never lose a measurement to quitting or backgrounding,
+    /// so the app-wide cache flushes whenever the app terminates or deactivates.
+    func observeApplicationLifecycle(center: NotificationCenter = .default) {
+        for name in [NSApplication.willTerminateNotification, NSApplication.didResignActiveNotification] {
+            center.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
+                // AppKit posts both on the main thread, so the flush runs
+                // synchronously before the process can exit.
+                if Thread.isMainThread {
+                    MainActor.assumeIsolated { self?.flushPendingHeightWrites() }
+                } else {
+                    Task { @MainActor in self?.flushPendingHeightWrites() }
+                }
+            }
+        }
+    }
+
+    /// A burst of measurements serializes the dictionary once, not once per height.
+    private func scheduleHeightPersistence() {
+        guard pendingHeightWrite == nil else { return }
+        pendingHeightWrite = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard let self, !Task.isCancelled else { return }
+            self.pendingHeightWrite = nil
+            self.userDefaults.set(self.heights, forKey: self.heightStorageKey)
+        }
     }
 
     func snapshot(for key: String) async -> NSImage? {
@@ -114,7 +181,14 @@ final class EditorEmbedCache {
     func saveSnapshot(_ image: NSImage, for key: String) async {
         guard let bitmap = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
         imageCache.setObject(image, forKey: key as NSString, cost: bitmap.bytesPerRow * bitmap.height)
-        await store.save(bitmap, for: key)
+        guard let data = await Self.encodePNG(bitmap) else { return }
+        await store.save(data, for: key)
+    }
+
+    /// Runs on the cooperative pool: neither the main actor nor the store
+    /// waits on the encoder.
+    private nonisolated static func encodePNG(_ image: CGImage) async -> Data? {
+        EmbedSnapshotStore.pngData(for: image)
     }
 
     private func heightKey(_ statusID: String, _ width: CGFloat) -> String {

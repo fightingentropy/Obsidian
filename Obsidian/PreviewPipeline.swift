@@ -1,6 +1,7 @@
 import AppKit
 import Down
 import Foundation
+import ImageIO
 import libcmark
 import SwiftUI
 import Textual
@@ -16,6 +17,32 @@ struct PreviewContext: Equatable {
 
     var previewBaseURL: URL? {
         documentDirectoryURL ?? vaultURL
+    }
+
+    /// Cheap, order-independent fingerprint of `assetLookupByFilename`.
+    ///
+    /// Every entry is hashed on its own and the per-entry digests are XORed
+    /// together, so the result does not depend on dictionary iteration order
+    /// and nothing is sorted or copied. Values are included (not just keys) so
+    /// a note that moves between folders without changing its filename still
+    /// changes the fingerprint. `Hasher` is seeded per process, which is fine
+    /// for the in-memory caches this feeds.
+    var assetLookupFingerprint: Int {
+        var combined = 0
+        for (filename, urls) in assetLookupByFilename {
+            var entryHasher = Hasher()
+            entryHasher.combine(filename)
+            entryHasher.combine(urls.count)
+            for url in urls {
+                entryHasher.combine(url)
+            }
+            combined ^= entryHasher.finalize()
+        }
+
+        var hasher = Hasher()
+        hasher.combine(assetLookupByFilename.count)
+        hasher.combine(combined)
+        return hasher.finalize()
     }
 }
 
@@ -83,6 +110,61 @@ struct PreviewDocument {
         }
         .joined(separator: "\n")
     }
+
+    /// The segments paired with identities that survive both edits inside a
+    /// segment and insertions above it.
+    ///
+    /// Embeds are keyed by their `EditorLinkPreview` id (plus an ordinal for
+    /// repeats of the same embed). Markdown and mermaid segments are keyed
+    /// structurally, never by content: by the embed that precedes them (or the
+    /// document start) and by their ordinal among segments of the same kind
+    /// since that anchor, e.g. `after:embed:abc#0/markdown#1`. Typing inside a
+    /// segment therefore keeps its id, so SwiftUI updates the existing view
+    /// (and its `WKWebView` and measured height) in place instead of tearing it
+    /// down on every keystroke, while inserting a paragraph above an embed does
+    /// not re-target the embed cards or the segments below them.
+    var identifiedSegments: [IdentifiedPreviewSegment] {
+        var embedOccurrences: [String: Int] = [:]
+        var anchor = "start"
+        var ordinalsSinceAnchor: [String: Int] = [:]
+        var identified: [IdentifiedPreviewSegment] = []
+        identified.reserveCapacity(segments.count)
+
+        for segment in segments {
+            let id: String
+            switch segment {
+            case .embed(let preview):
+                let base = "embed:\(preview.id)"
+                let ordinal = embedOccurrences[base, default: 0]
+                embedOccurrences[base] = ordinal + 1
+                id = "\(base)#\(ordinal)"
+                anchor = id
+                ordinalsSinceAnchor.removeAll(keepingCapacity: true)
+            case .markdown:
+                id = Self.structuralIdentity(kind: "markdown", anchor: anchor, ordinals: &ordinalsSinceAnchor)
+            case .mermaid:
+                id = Self.structuralIdentity(kind: "mermaid", anchor: anchor, ordinals: &ordinalsSinceAnchor)
+            }
+            identified.append(IdentifiedPreviewSegment(id: id, segment: segment))
+        }
+
+        return identified
+    }
+
+    private static func structuralIdentity(
+        kind: String,
+        anchor: String,
+        ordinals: inout [String: Int]
+    ) -> String {
+        let ordinal = ordinals[kind, default: 0]
+        ordinals[kind] = ordinal + 1
+        return "after:\(anchor)/\(kind)#\(ordinal)"
+    }
+}
+
+struct IdentifiedPreviewSegment: Identifiable {
+    let id: String
+    let segment: PreviewSegment
 }
 
 enum PreviewPipelineError: Error {
@@ -177,35 +259,15 @@ struct AssetResolver {
             }
         }
 
+        // The asset index (`assetLookupByFilename`) already lists every regular
+        // file in the vault, so a bare filename that is not in it does not
+        // exist; there is no need to walk the vault on disk here.
         if let indexedMatches = context.assetLookupByFilename[normalized], !indexedMatches.isEmpty {
             let match = indexedMatches.count == 1 ? indexedMatches[0] : indexedMatches.first
             return match.flatMap(containedAssetURL)
         }
 
-        guard !normalized.contains("/"), let vaultURL = context.vaultURL else {
-            return nil
-        }
-
-        guard let enumerator = FileManager.default.enumerator(
-            at: vaultURL,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return nil
-        }
-
-        var matches: [URL] = []
-        for case let fileURL as URL in enumerator where fileURL.lastPathComponent == normalized {
-            if let contained = containedAssetURL(fileURL.standardizedFileURL) {
-                matches.append(contained)
-            }
-        }
-
-        if matches.count == 1 {
-            return matches[0]
-        }
-
-        return matches.first
+        return nil
     }
 
     private func containedAssetURL(_ url: URL) -> URL? {
@@ -309,38 +371,84 @@ private final class PreviewDocumentBox {
     init(_ document: PreviewDocument) { self.document = document }
 }
 
+private final class NoteReferenceResolverBox {
+    let resolver: NoteReferenceResolver
+    init(_ resolver: NoteReferenceResolver) { self.resolver = resolver }
+}
+
 enum MarkdownPreprocessor {
-    // Cache of recent `PreviewDocument` values keyed by document path and
-    // markdown contents. The preview pipeline runs on every body evaluation —
-    // at least twice per render (once to choose the render mode, once inside
-    // the native markup parser) — so reusing unchanged parses avoids redundant
-    // O(doc-length) scanning on every keystroke.
+    // Cache of recent `PreviewDocument` values keyed by document path,
+    // markdown contents and the asset-index fingerprint. The preview pipeline
+    // runs on every body evaluation — at least twice per render (once to
+    // choose the render mode, once inside the native markup parser) — so
+    // reusing unchanged parses avoids redundant O(doc-length) scanning on
+    // every keystroke. Including the asset fingerprint means a newly indexed
+    // file (e.g. a just-dropped image) re-resolves without a text change.
     nonisolated(unsafe) private static let preprocessCache: NSCache<NSString, PreviewDocumentBox> = {
         let cache = NSCache<NSString, PreviewDocumentBox>()
         cache.countLimit = 8
         return cache
     }()
 
+    // Cache of recently built `NoteReferenceResolver`s. Building one resolves
+    // symlinks for every note in the vault, which is far too expensive to
+    // repeat on every keystroke when the asset index has not changed.
+    nonisolated(unsafe) private static let noteResolverCache: NSCache<NSString, NoteReferenceResolverBox> = {
+        let cache = NSCache<NSString, NoteReferenceResolverBox>()
+        cache.countLimit = 4
+        return cache
+    }()
+
     static func preprocessCached(_ markdown: String, context: PreviewContext) -> PreviewDocument {
-        let key = cacheKey(for: markdown, context: context)
+        let fingerprint = context.assetLookupFingerprint
+        let key = cacheKey(for: markdown, context: context, assetLookupFingerprint: fingerprint)
         if let cached = preprocessCache.object(forKey: key) {
             return cached.document
         }
-        let document = preprocess(markdown, context: context)
+        let document = preprocess(markdown, context: context, assetLookupFingerprint: fingerprint)
         preprocessCache.setObject(PreviewDocumentBox(document), forKey: key)
         return document
     }
 
-    private static func cacheKey(for markdown: String, context: PreviewContext) -> NSString {
+    private static func cacheKey(
+        for markdown: String,
+        context: PreviewContext,
+        assetLookupFingerprint: Int
+    ) -> NSString {
         var hasher = Hasher()
         hasher.combine(markdown)
         hasher.combine(context.documentURL)
         hasher.combine(context.vaultURL)
+        hasher.combine(assetLookupFingerprint)
         let digest = hasher.finalize()
-        return "\(context.documentURL?.path ?? "")|\(markdown.utf8.count)|\(digest)" as NSString
+        return "\(context.documentURL?.path ?? "")|\(markdown.utf8.count)|\(assetLookupFingerprint)|\(digest)" as NSString
+    }
+
+    private static func noteResolver(for context: PreviewContext, assetLookupFingerprint: Int) -> NoteReferenceResolver {
+        let key = "\(assetLookupFingerprint)|\(context.vaultURL?.path ?? "")" as NSString
+        if let cached = noteResolverCache.object(forKey: key) {
+            return cached.resolver
+        }
+
+        let resolver = NoteReferenceResolver(
+            noteURLs: context.assetLookupByFilename.values
+                .flatMap { $0 }
+                .filter(Workspace.isMarkdownFile),
+            vaultURL: context.vaultURL
+        )
+        noteResolverCache.setObject(NoteReferenceResolverBox(resolver), forKey: key)
+        return resolver
     }
 
     static func preprocess(_ markdown: String, context: PreviewContext) -> PreviewDocument {
+        preprocess(markdown, context: context, assetLookupFingerprint: context.assetLookupFingerprint)
+    }
+
+    private static func preprocess(
+        _ markdown: String,
+        context: PreviewContext,
+        assetLookupFingerprint: Int
+    ) -> PreviewDocument {
         let normalizedSource = markdown.replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
         let lines = normalizedSource.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
@@ -353,12 +461,7 @@ enum MarkdownPreprocessor {
             offset += (line as NSString).length + 1
         }
         let resolver = AssetResolver(context: context)
-        let noteResolver = NoteReferenceResolver(
-            noteURLs: context.assetLookupByFilename.values
-                .flatMap { $0 }
-                .filter(Workspace.isMarkdownFile),
-            vaultURL: context.vaultURL
-        )
+        let noteResolver = noteResolver(for: context, assetLookupFingerprint: assetLookupFingerprint)
 
         let references = embeds.isEmpty ? "" : referenceDefinitions(in: lines)
         var segments: [PreviewSegment] = []
@@ -474,10 +577,14 @@ enum MarkdownPreprocessor {
         )
     }
 
+    private static let referenceDefinitionPattern = try! NSRegularExpression(
+        pattern: #"^ {0,3}\[[^\]\n]+\]:[ \t]*\S+"#
+    )
+
     private static func referenceDefinitions(in lines: [String]) -> String {
         var definitions: [String] = []
         var fence: String?
-        let definition = try! NSRegularExpression(pattern: #"^ {0,3}\[[^\]\n]+\]:[ \t]*\S+"#)
+        let definition = referenceDefinitionPattern
         var index = 0
         while index < lines.count {
             let line = lines[index]
@@ -793,6 +900,12 @@ enum HTMLPreviewRenderer {
     private static let mathDisplayParagraphPattern = try! NSRegularExpression(
         pattern: "<p>\\s*(<span class=\"math-display\">[^<]*</span>)\\s*</p>"
     )
+    private static let dangerousURLSchemePatterns: [NSRegularExpression] = [
+        try! NSRegularExpression(pattern: #"(?i)(href|src)\s*=\s*"\s*(?:javascript|vbscript):[^"]*""#),
+        try! NSRegularExpression(pattern: #"(?i)(href|src)\s*=\s*'\s*(?:javascript|vbscript):[^']*'"#),
+        try! NSRegularExpression(pattern: #"(?i)(href|src)\s*=\s*"\s*data:(?!image/)[^"]*""#),
+        try! NSRegularExpression(pattern: #"(?i)(href|src)\s*=\s*'\s*data:(?!image/)[^']*'"#),
+    ]
 
     // Cache of rendered mermaid SVGs keyed by the mermaid source text.
     // The preview pipeline re-runs on every text change; diagrams are
@@ -914,14 +1027,7 @@ enum HTMLPreviewRenderer {
     /// here (keeping `data:image/…` so inline images still work).
     private static func sanitizeDangerousURLSchemes(in html: String) -> String {
         var result = html
-        let patterns = [
-            #"(?i)(href|src)\s*=\s*"\s*(?:javascript|vbscript):[^"]*""#,
-            #"(?i)(href|src)\s*=\s*'\s*(?:javascript|vbscript):[^']*'"#,
-            #"(?i)(href|src)\s*=\s*"\s*data:(?!image/)[^"]*""#,
-            #"(?i)(href|src)\s*=\s*'\s*data:(?!image/)[^']*'"#
-        ]
-        for pattern in patterns {
-            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+        for regex in dangerousURLSchemePatterns {
             let range = NSRange(result.startIndex..., in: result)
             result = regex.stringByReplacingMatches(in: result, range: range, withTemplate: "$1=\"#\"")
         }
@@ -944,60 +1050,76 @@ enum HTMLPreviewRenderer {
         )
     }
 
+    /// Replaces every match of `pattern` in `string` in a single forward pass.
+    ///
+    /// `replacement` receives each match and the original `NSString`, and
+    /// returns the text to emit in place of the whole match, or `nil` to keep
+    /// the matched text untouched. Untouched slices and replacements are
+    /// appended to one pre-sized buffer, so the cost is linear in the length
+    /// of the string plus the number of matches — unlike repeatedly calling
+    /// `replacingCharacters(in:with:)`, which rebuilds the whole string per
+    /// match and is quadratic in the number of matches.
+    private static func replacingMatches(
+        of pattern: NSRegularExpression,
+        in string: String,
+        using replacement: (NSTextCheckingResult, NSString) -> String?
+    ) -> String {
+        let nsString = string as NSString
+        let length = nsString.length
+        let matches = pattern.matches(in: string, range: NSRange(location: 0, length: length))
+        guard !matches.isEmpty else { return string }
+
+        let result = NSMutableString(capacity: length + matches.count * 32)
+        var cursor = 0
+        for match in matches {
+            guard let replacementText = replacement(match, nsString) else {
+                continue
+            }
+
+            let matchRange = match.range
+            if matchRange.location > cursor {
+                result.append(nsString.substring(with: NSRange(location: cursor, length: matchRange.location - cursor)))
+            }
+            result.append(replacementText)
+            cursor = NSMaxRange(matchRange)
+        }
+
+        if cursor < length {
+            result.append(nsString.substring(from: cursor))
+        }
+
+        return result as String
+    }
+
     private static func substituteMathTokens(
         in html: String,
         pattern: NSRegularExpression,
         cssClass: String
     ) -> String {
-        let nsHTML = html as NSString
-        let matches = pattern.matches(
-            in: html,
-            range: NSRange(location: 0, length: nsHTML.length)
-        )
-        guard !matches.isEmpty else { return html }
-
-        var result = html
-        for match in matches.reversed() {
+        replacingMatches(of: pattern, in: html) { match, nsHTML in
             let hexRange = match.range(at: 1)
-            guard hexRange.location != NSNotFound else { continue }
-            let hex = (result as NSString).substring(with: hexRange)
+            guard hexRange.location != NSNotFound else { return nil }
+            let hex = nsHTML.substring(with: hexRange)
             let latex = MathTokenCoder.decode(hex: hex)
             let escaped = escapeHTML(latex)
-            let replacement = "<span class=\"\(cssClass)\">\(escaped)</span>"
-            result = (result as NSString).replacingCharacters(in: match.range, with: replacement)
+            return "<span class=\"\(cssClass)\">\(escaped)</span>"
         }
-        return result
     }
 
     private static func transformParagraphBlocks(in html: String) -> String {
-        let nsHTML = html as NSString
-        let range = NSRange(location: 0, length: nsHTML.length)
-        let matches = paragraphBlockPattern.matches(in: html, range: range)
-        guard !matches.isEmpty else { return html }
-
-        var transformed = html
-
-        for match in matches.reversed() {
+        replacingMatches(of: paragraphBlockPattern, in: html) { match, nsHTML in
             let contentRange = match.range(at: 1)
             guard contentRange.location != NSNotFound else {
-                continue
+                return nil
             }
 
             let originalContent = nsHTML.substring(with: contentRange)
-            let replacement: String
             if let tableHTML = renderTableParagraphIfNeeded(from: originalContent) {
-                replacement = tableHTML
-            } else {
-                replacement = "<p>\(replaceStrikethrough(in: autolinkBareURLs(in: originalContent)))</p>"
+                return tableHTML
             }
 
-            transformed = (transformed as NSString).replacingCharacters(
-                in: match.range,
-                with: replacement
-            )
+            return "<p>\(replaceStrikethrough(in: autolinkBareURLs(in: originalContent)))</p>"
         }
-
-        return transformed
     }
 
     private static func renderTableParagraphIfNeeded(from paragraphContent: String) -> String? {
@@ -1042,40 +1164,22 @@ enum HTMLPreviewRenderer {
     }
 
     private static func autolinkBareURLs(in string: String) -> String {
-        let nsString = string as NSString
-        let range = NSRange(location: 0, length: nsString.length)
-        let matches = bareURLPattern.matches(in: string, range: range)
-        guard !matches.isEmpty else { return string }
-
-        var result = string
-        for match in matches.reversed() {
+        replacingMatches(of: bareURLPattern, in: string) { match, nsString in
             let url = nsString.substring(with: match.range)
-            let replacement = "<a href=\"\(url)\">\(url)</a>"
-            result = (result as NSString).replacingCharacters(in: match.range, with: replacement)
+            return "<a href=\"\(url)\">\(url)</a>"
         }
-
-        return result
     }
 
     private static func replaceStrikethrough(in string: String) -> String {
-        let nsString = string as NSString
-        let range = NSRange(location: 0, length: nsString.length)
-        let matches = strikethroughPattern.matches(in: string, range: range)
-        guard !matches.isEmpty else { return string }
-
-        var result = string
-        for match in matches.reversed() {
+        replacingMatches(of: strikethroughPattern, in: string) { match, nsString in
             let innerRange = match.range(at: 1)
             guard innerRange.location != NSNotFound else {
-                continue
+                return nil
             }
 
             let content = nsString.substring(with: innerRange)
-            let replacement = "<del>\(content)</del>"
-            result = (result as NSString).replacingCharacters(in: match.range, with: replacement)
+            return "<del>\(content)</del>"
         }
-
-        return result
     }
 
     private static func parseTableRow(_ line: String) -> [String] {
@@ -1234,9 +1338,23 @@ struct PreviewImageAttachmentLoader: AttachmentLoader {
         return PreviewImageAttachment(
             id: loaded.resolvedURL.absoluteString,
             text: text,
-            data: loaded.data,
+            image: PreviewDecodedImage(data: loaded.data),
             intrinsicSize: size
         )
+    }
+}
+
+/// Holds the `NSImage` decoded once for a `PreviewImageAttachment` so the
+/// attachment's `body` does not re-create it on every evaluation.
+///
+/// `NSImage` is not formally `Sendable`, but the instance here is created
+/// once, never mutated afterwards and only drawn from, which is the usage
+/// AppKit documents as safe across threads.
+final class PreviewDecodedImage: @unchecked Sendable {
+    let image: NSImage?
+
+    init(data: Data) {
+        image = NSImage(data: data)
     }
 }
 
@@ -1296,7 +1414,14 @@ enum PreviewImageSourceLoader {
         return expectedLength < 0 || expectedLength <= Int64(maximumRemoteImageBytes)
     }
 
+    /// Reads the pixel size from the image container's metadata without
+    /// decoding the bitmap. Formats ImageIO cannot read (notably SVG) fall
+    /// back to a full `NSImage` decode.
     static func imageSize(for data: Data, url: URL) throws -> CGSize {
+        if let size = pixelSizeFromImageSource(data) {
+            return size
+        }
+
         guard let image = NSImage(data: data) else {
             throw PreviewPipelineError.invalidImageData(url)
         }
@@ -1309,12 +1434,40 @@ enum PreviewImageSourceLoader {
 
         return image.size
     }
+
+    private static func pixelSizeFromImageSource(_ data: Data) -> CGSize? {
+        let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions),
+              CGImageSourceGetCount(source) > 0,
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, sourceOptions) as? [CFString: Any],
+              let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue else {
+            return nil
+        }
+
+        let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.uint32Value ?? 1
+        return pixelSize(width: width, height: height, orientation: orientation)
+    }
+
+    /// Applies an EXIF/TIFF orientation (1...8) to raw pixel dimensions.
+    /// Orientations 5 through 8 rotate by 90°, swapping width and height.
+    static func pixelSize(width: Int, height: Int, orientation: UInt32) -> CGSize? {
+        guard width > 0, height > 0 else {
+            return nil
+        }
+
+        if (5...8).contains(orientation) {
+            return CGSize(width: height, height: width)
+        }
+
+        return CGSize(width: width, height: height)
+    }
 }
 
 struct PreviewImageAttachment: Attachment {
     let id: String
     let text: String
-    let data: Data
+    let image: PreviewDecodedImage
     let intrinsicSize: CGSize
 
     var description: String {
@@ -1324,8 +1477,8 @@ struct PreviewImageAttachment: Attachment {
     @MainActor
     var body: some View {
         Group {
-            if let image = NSImage(data: data) {
-                Image(nsImage: image)
+            if let nsImage = image.image {
+                Image(nsImage: nsImage)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
             } else {

@@ -48,6 +48,38 @@ final class ObsidianMetadataCoreTests: XCTestCase {
         XCTAssertEqual(frontmatter.value(forKey: "complex"), .raw("\n  nested: value"))
     }
 
+    func testColumnZeroBlockSequenceItemsStayWithTheirKey() {
+        let markdown = """
+        ---
+        links:
+        - url: a
+          title: First
+        - url: b
+        tags:
+        - alpha
+        - beta
+        status: active
+        ---
+        Body
+        """
+
+        let metadata = ObsidianMetadataParser.parse(markdown)
+
+        // The colon inside `- url: a` used to start a bogus "- url" key and
+        // leave `links` empty.
+        XCTAssertEqual(Set(metadata.properties.keys), ["links", "tags", "status"])
+        XCTAssertEqual(metadata.properties["links"], .raw("\n- url: a\n  title: First\n- url: b"))
+        XCTAssertEqual(metadata.properties["tags"], .strings(["alpha", "beta"]))
+        XCTAssertEqual(metadata.frontmatterTags, ["alpha", "beta"])
+        XCTAssertEqual(metadata.properties["status"], .string("active"))
+
+        // A column-0 sequence decodes exactly like the indented spelling.
+        XCTAssertEqual(
+            ObsidianMetadataParser.parse("---\nrefs:\n- url: a\n- b\n---\n").properties["refs"],
+            ObsidianMetadataParser.parse("---\nrefs:\n  - url: a\n  - b\n---\n").properties["refs"]
+        )
+    }
+
     func testUnterminatedFrontmatterIsNotGuessed() {
         let markdown = "---\ntitle: Not metadata\n# Heading"
         let metadata = ObsidianMetadataParser.parse(markdown)
@@ -89,6 +121,70 @@ final class ObsidianMetadataCoreTests: XCTestCase {
         XCTAssertEqual(outline[0].children.map(\.title), ["Child", "Sibling", "Setext"])
         XCTAssertEqual(outline[0].children[0].children.map(\.title), ["Grandchild"])
         XCTAssertEqual(outline[0].lineNumber, 1)
+    }
+
+    func testNumberDecodingAcceptsOnlyPlainDecimalLiterals() {
+        let markdown = """
+        ---
+        integer: 5
+        trailingDot: 5.
+        leadingDot: .5
+        signed: +5
+        negative: -0.5
+        exponent: 1e5
+        hexadecimal: 0x10
+        infinity: inf
+        notANumber: nan
+        doubleDot: 1.2.3
+        quoted: "7"
+        underscored: 1_000
+        ---
+        Body
+        """
+
+        let properties = ObsidianMetadataParser.parse(markdown).properties
+
+        XCTAssertEqual(properties["integer"], .number(5))
+        XCTAssertEqual(properties["trailingDot"], .number(5))
+        XCTAssertEqual(properties["leadingDot"], .number(0.5))
+        XCTAssertEqual(properties["signed"], .number(5))
+        XCTAssertEqual(properties["negative"], .number(-0.5))
+        XCTAssertEqual(properties["exponent"], .string("1e5"))
+        XCTAssertEqual(properties["hexadecimal"], .string("0x10"))
+        XCTAssertEqual(properties["infinity"], .string("inf"))
+        XCTAssertEqual(properties["notANumber"], .string("nan"))
+        XCTAssertEqual(properties["doubleDot"], .string("1.2.3"))
+        XCTAssertEqual(properties["quoted"], .string("7"))
+        XCTAssertEqual(properties["underscored"], .string("1_000"))
+    }
+
+    func testAliasesHelperReadsBothKeysAndDeduplicatesCaseInsensitively() {
+        XCTAssertEqual(
+            ObsidianMetadataParser.aliases(in: ["aliases": .strings(["Atlas", "atlas", "Project A", ""])]),
+            ["Atlas", "Project A"]
+        )
+        XCTAssertEqual(ObsidianMetadataParser.aliases(in: ["Alias": .string("Solo")]), ["Solo"])
+        XCTAssertEqual(ObsidianMetadataParser.aliases(in: ["title": .string("No aliases")]), [])
+        XCTAssertEqual(
+            ObsidianMetadataParser.aliases(in: ObsidianMetadataParser.searchMetadata(in: "---\naliases: [One, two]\n---\n").properties),
+            ["One", "two"]
+        )
+    }
+
+    func testAtxHeadingsStripOnlyClosingHashRuns() {
+        let markdown = """
+        # Title ##
+        ## Keep #hashtag
+        ### Only ###
+        #### Spaced   ##
+        """
+
+        let outline = ObsidianMetadataParser.parse(markdown).outline
+
+        XCTAssertEqual(outline.map(\.title), ["Title"])
+        XCTAssertEqual(outline[0].children.map(\.title), ["Keep #hashtag"])
+        XCTAssertEqual(outline[0].children[0].children.map(\.title), ["Only"])
+        XCTAssertEqual(outline[0].children[0].children[0].children.map(\.title), ["Spaced"])
     }
 
     func testRendersBuiltInTemplateVariablesDeterministically() throws {

@@ -135,16 +135,20 @@ private struct EmbeddedMarkdownPreview: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 16) {
-                ForEach(Array(document.segments.enumerated()), id: \.offset) { _, segment in
-                    switch segment {
+                // Keyed by structural identities (see
+                // `PreviewDocument.identifiedSegments`): stable while the user
+                // types inside a segment (the view and its WKWebView are
+                // updated in place) and when a paragraph is inserted above an
+                // embed (no later WKWebView is re-targeted).
+                ForEach(document.identifiedSegments) { identified in
+                    switch identified.segment {
                     case .embed(let preview):
                         ReadingEmbedCard(preview: preview, openURL: openURL)
-                            .id(preview.id)
                     case .markdown(let markdown) where !document.requiresHTMLFallback:
                         NativeMarkdownContent(markdown: markdown, context: document.context, preferences: preferences)
                     default:
                         FittedHTMLPreview(document: PreviewDocument(source: document.source, context: document.context,
-                            segments: [segment], requiresHTMLFallback: true), preferences: preferences,
+                            segments: [identified.segment], requiresHTMLFallback: true), preferences: preferences,
                             onOpenInternalFile: onOpenInternalFile)
                     }
                 }
@@ -204,8 +208,8 @@ private struct FittedHTMLPreview: View {
     @State private var height: CGFloat = 1
 
     var body: some View {
-        HTMLPreviewWebView(html: PreviewStylesheet.page(body: HTMLPreviewRenderer.render(document: document),
-            preferences: preferences, compact: true), baseURL: document.context.previewBaseURL,
+        HTMLPreviewWebView(html: PreviewPageCache.page(for: document, preferences: preferences, compact: true),
+            baseURL: document.context.previewBaseURL, documentURL: document.context.documentURL,
             vaultURL: document.context.vaultURL, onOpenInternalFile: onOpenInternalFile,
             heightChanged: { height = max(1, $0) })
             .frame(height: height)
@@ -217,20 +221,79 @@ private struct HTMLMarkdownPreview: View {
     let preferences: AppPreferences
     let onOpenInternalFile: (URL) -> Void
 
-    private var fullPageHTML: String {
-        PreviewStylesheet.page(
-            body: HTMLPreviewRenderer.render(document: document),
-            preferences: preferences
-        )
-    }
-
     var body: some View {
         HTMLPreviewWebView(
-            html: fullPageHTML,
+            html: PreviewPageCache.page(for: document, preferences: preferences, compact: false),
             baseURL: document.context.previewBaseURL,
+            documentURL: document.context.documentURL,
             vaultURL: document.context.vaultURL,
             onOpenInternalFile: onOpenInternalFile
         )
+    }
+}
+
+/// Memoizes fully rendered preview pages. SwiftUI evaluates `body` far more
+/// often than the input changes, and each evaluation used to re-run cmark
+/// plus the post-processing passes and rebuild the page; with this cache an
+/// evaluation with unchanged input is a dictionary lookup.
+@MainActor
+enum PreviewPageCache {
+    private static let cache: NSCache<NSString, NSString> = {
+        let cache = NSCache<NSString, NSString>()
+        cache.countLimit = 32
+        return cache
+    }()
+
+    static func page(for document: PreviewDocument, preferences: AppPreferences, compact: Bool) -> String {
+        let signature = PreviewStylesheet.StyleSignature(preferences: preferences)
+        let key = cacheKey(for: document, signature: signature, compact: compact)
+        if let cached = cache.object(forKey: key) {
+            return cached as String
+        }
+
+        let page = PreviewStylesheet.page(
+            body: HTMLPreviewRenderer.render(document: document),
+            preferences: preferences,
+            compact: compact
+        )
+        cache.setObject(page as NSString, forKey: key)
+        return page
+    }
+
+    /// Everything the rendered page depends on: the exact segments being
+    /// rendered (they already carry the resolved asset URLs, and
+    /// `HTMLPreviewRenderer.render(document:)` reads nothing else), the
+    /// stylesheet inputs and the compact flag. The note's full `source` and
+    /// document URL are deliberately left out: a fitted single-segment
+    /// document shares them with its siblings, so keying on them would miss the
+    /// cache for every segment on every keystroke.
+    private static func cacheKey(
+        for document: PreviewDocument,
+        signature: PreviewStylesheet.StyleSignature,
+        compact: Bool
+    ) -> NSString {
+        var hasher = Hasher()
+        hasher.combine(document.segments.count)
+        for segment in document.segments {
+            switch segment {
+            case .markdown(let markdown):
+                hasher.combine(0 as UInt8)
+                hasher.combine(markdown)
+            case .mermaid(let source, _):
+                // The diagram is derived from `source` by `MermaidParser`.
+                hasher.combine(1 as UInt8)
+                hasher.combine(source)
+            case .embed(let preview):
+                hasher.combine(2 as UInt8)
+                hasher.combine(preview.id)
+                hasher.combine(preview.title)
+                hasher.combine(preview.url)
+            }
+        }
+        hasher.combine(signature)
+        hasher.combine(compact)
+        let digest = hasher.finalize()
+        return "\(document.segments.count)|\(compact)|\(digest)" as NSString
     }
 }
 
@@ -314,9 +377,17 @@ private struct HTMLPreviewWebView: NSViewRepresentable {
         var lastHTML: String?
         var scrollForwarder: EmbedScrollForwarder?
         var lastBaseURL: URL?
+        var lastDocumentURL: URL?
         var heightChanged: ((CGFloat) -> Void)?
         var vaultURL: URL?
         var onOpenInternalFile: (URL) -> Void
+
+        /// Latest vertical scroll offset reported by the page (CSS pixels).
+        /// Reloading the page resets it to the top, so `updateNSView` carries
+        /// this value over through `pendingScrollRestore` when the same
+        /// document is re-rendered after an edit.
+        var scrollY: CGFloat = 0
+        var pendingScrollRestore: CGFloat?
 
         init(vaultURL: URL?, onOpenInternalFile: @escaping (URL) -> Void) {
             self.vaultURL = vaultURL
@@ -331,6 +402,12 @@ private struct HTMLPreviewWebView: NSViewRepresentable {
             if message.name == "previewHeight", let value = message.body as? Double,
                value.isFinite, value > 0 {
                 heightChanged?(CGFloat(ceil(value)))
+                return
+            }
+            if message.name == "previewScroll" {
+                if let value = message.body as? Double, value.isFinite, value >= 0 {
+                    scrollY = CGFloat(value)
+                }
                 return
             }
             guard message.name == "openLink",
@@ -366,6 +443,19 @@ private struct HTMLPreviewWebView: NSViewRepresentable {
             }
         }
 
+        /// Re-applies the scroll offset captured before the reload, so editing
+        /// a note in split mode does not snap the preview back to the top.
+        /// `evaluateJavaScript` is native-injected and therefore not subject
+        /// to the page's CSP. The browser clamps the offset if the new page is
+        /// shorter.
+        @MainActor
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            guard let offset = pendingScrollRestore else { return }
+            pendingScrollRestore = nil
+            guard offset > 0 else { return }
+            webView.evaluateJavaScript("window.scrollTo(0, \(Int(offset.rounded())));", completionHandler: nil)
+        }
+
         private func route(_ url: URL) {
             if let internalURL = PreviewURLPolicy.internalVaultFile(url, vaultURL: vaultURL) {
                 onOpenInternalFile(internalURL)
@@ -384,6 +474,9 @@ private struct HTMLPreviewWebView: NSViewRepresentable {
 
     let html: String
     let baseURL: URL?
+    /// Identity of the note being shown. Scroll position is preserved across
+    /// reloads only while this stays the same; a different note starts at top.
+    let documentURL: URL?
     let vaultURL: URL?
     let onOpenInternalFile: (URL) -> Void
     var heightChanged: ((CGFloat) -> Void)? = nil
@@ -431,6 +524,28 @@ private struct HTMLPreviewWebView: NSViewRepresentable {
                 new ResizeObserver(reportPreviewHeight).observe(document.body);
                 reportPreviewHeight();
                 """, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        } else {
+            // Full-page mode only: fitted (compact) pages never scroll, their
+            // host SwiftUI ScrollView does. A WKUserScript is injected by the
+            // engine rather than the document, so the page CSP does not apply
+            // to it; it only posts the offset, throttled to one message per
+            // frame, and never reads anything back.
+            configuration.userContentController.add(context.coordinator, name: "previewScroll")
+            configuration.userContentController.addUserScript(WKUserScript(source: """
+                (function() {
+                    var pending = false;
+                    function reportPreviewScroll() {
+                        pending = false;
+                        var element = document.scrollingElement || document.documentElement;
+                        window.webkit.messageHandlers.previewScroll.postMessage(element.scrollTop);
+                    }
+                    window.addEventListener('scroll', function() {
+                        if (pending) { return; }
+                        pending = true;
+                        window.requestAnimationFrame(reportPreviewScroll);
+                    }, { passive: true });
+                })();
+                """, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         }
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
@@ -447,8 +562,18 @@ private struct HTMLPreviewWebView: NSViewRepresentable {
             return
         }
 
+        // Carry the reader's position over the reload only when it is the
+        // same note being re-rendered; switching notes starts at the top.
+        let isSameDocument = context.coordinator.lastHTML != nil
+            && context.coordinator.lastDocumentURL == documentURL
+        context.coordinator.pendingScrollRestore = isSameDocument ? context.coordinator.scrollY : nil
+        if !isSameDocument {
+            context.coordinator.scrollY = 0
+        }
+
         context.coordinator.lastHTML = html
         context.coordinator.lastBaseURL = baseURL
+        context.coordinator.lastDocumentURL = documentURL
         nsView.loadHTMLString(html, baseURL: baseURL)
     }
 

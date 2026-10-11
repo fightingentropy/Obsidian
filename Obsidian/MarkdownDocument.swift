@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import UniformTypeIdentifiers
 
 struct FileItem: Identifiable, Hashable, Sendable {
@@ -7,6 +8,42 @@ struct FileItem: Identifiable, Hashable, Sendable {
     let url: URL
     let modificationDate: Date
     let noteTitle: String?
+    /// `url` with symlinks resolved and standardized. Workspace lookups
+    /// compare this string so matching a file never resolves URLs again.
+    let canonicalPath: String
+
+    init(
+        id: URL,
+        name: String,
+        url: URL,
+        modificationDate: Date,
+        noteTitle: String?,
+        canonicalPath: String
+    ) {
+        self.id = id
+        self.name = name
+        self.url = url
+        self.modificationDate = modificationDate
+        self.noteTitle = noteTitle
+        self.canonicalPath = canonicalPath
+    }
+
+    /// Resolves `canonicalPath` from `url`. Construction sites that already
+    /// hold the canonical path pass it to the designated initializer instead.
+    init(id: URL, name: String, url: URL, modificationDate: Date, noteTitle: String?) {
+        self.init(
+            id: id,
+            name: name,
+            url: url,
+            modificationDate: modificationDate,
+            noteTitle: noteTitle,
+            canonicalPath: Self.canonicalPath(for: url)
+        )
+    }
+
+    static func canonicalPath(for url: URL) -> String {
+        url.resolvingSymlinksInPath().standardizedFileURL.path
+    }
 
     var displayName: String {
         url.deletingPathExtension().lastPathComponent
@@ -91,8 +128,112 @@ enum WorkspaceFileOperationError: LocalizedError {
 struct RecoveryDraft: Codable, Equatable, Sendable {
     let sourcePath: String
     let content: String
-    let baseContent: String
+    /// Lowercase hex SHA-256 of the on-disk text the unsaved edits were made
+    /// against. Automatic restore only needs to know whether disk still holds
+    /// exactly that base, so the base text itself is not stored.
+    let baseContentDigest: String
     let updatedAt: Date
+
+    init(sourcePath: String, content: String, baseContentDigest: String, updatedAt: Date) {
+        self.sourcePath = sourcePath
+        self.content = content
+        self.baseContentDigest = baseContentDigest
+        self.updatedAt = updatedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case sourcePath
+        case content
+        case baseContentDigest
+        case updatedAt
+        /// Drafts written before digests stored the complete base text.
+        case legacyBaseContent = "baseContent"
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sourcePath = try container.decode(String.self, forKey: .sourcePath)
+        content = try container.decode(String.self, forKey: .content)
+        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+        if let digest = try container.decodeIfPresent(String.self, forKey: .baseContentDigest) {
+            baseContentDigest = digest
+        } else {
+            // A legacy draft stays restorable exactly while disk still equals
+            // its stored base, which comparing digests of the two preserves.
+            let legacyBaseContent = try container.decode(String.self, forKey: .legacyBaseContent)
+            baseContentDigest = Self.digest(of: legacyBaseContent)
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(sourcePath, forKey: .sourcePath)
+        try container.encode(content, forKey: .content)
+        try container.encode(baseContentDigest, forKey: .baseContentDigest)
+        try container.encode(updatedAt, forKey: .updatedAt)
+    }
+
+    /// Whether `diskContent` is exactly the text these edits were made against.
+    func isBased(on diskContent: String) -> Bool {
+        baseContentDigest == Self.digest(of: diskContent)
+    }
+
+    /// Lowercase hex SHA-256 of the UTF-8 bytes of `content`.
+    static func digest(of content: String) -> String {
+        SHA256.hash(data: Data(content.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+}
+
+/// Identifies one deferred draft write reserved with
+/// `RecoveryStore.reserveDeferredWrite(for:)`.
+struct RecoveryDraftWriteTicket: Sendable {
+    let url: URL
+    fileprivate let key: String
+    fileprivate let generation: UInt64
+}
+
+/// Orders recovery-draft I/O between the main actor and detached writes.
+/// Every reservation gets a new generation; a deferred write runs only while
+/// its generation is still the newest for its note, and every write, move
+/// and removal runs under the lock. A slow stale write therefore can never
+/// land after a newer write or removal of the same note.
+private final class RecoveryDraftWriteGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastGeneration: UInt64 = 0
+    /// Notes with an outstanding deferred write, keyed by draft key.
+    private var reservedGenerationByKey: [String: UInt64] = [:]
+
+    func reserve(url: URL, key: String) -> RecoveryDraftWriteTicket {
+        lock.lock()
+        defer { lock.unlock() }
+        lastGeneration &+= 1
+        reservedGenerationByKey[key] = lastGeneration
+        return RecoveryDraftWriteTicket(url: url, key: key, generation: lastGeneration)
+    }
+
+    /// Runs `body` if `ticket` is still the newest request for its note.
+    @discardableResult
+    func runIfCurrent<T>(_ ticket: RecoveryDraftWriteTicket, _ body: () -> T) -> T? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard reservedGenerationByKey[ticket.key] == ticket.generation else { return nil }
+        reservedGenerationByKey.removeValue(forKey: ticket.key)
+        return body()
+    }
+
+    /// Supersedes every outstanding deferred write for `keys`, then runs
+    /// `body`, after any write already in progress has finished.
+    @discardableResult
+    func supersedeAndRun<T>(keys: [String], _ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        for key in keys {
+            reservedGenerationByKey.removeValue(forKey: key)
+        }
+        return try body()
+    }
 }
 
 /// A small, vault-independent crash-recovery store. Drafts live in Application
@@ -100,23 +241,46 @@ struct RecoveryDraft: Codable, Equatable, Sendable {
 /// iCloud container cannot take the only copy of unsaved text with it.
 struct RecoveryStore: Sendable {
     let directoryURL: URL
+    /// Shared by copies of this store, so every write through them is ordered.
+    private let writeGate = RecoveryDraftWriteGate()
 
     init(directoryURL: URL = RecoveryStore.defaultDirectoryURL()) {
         self.directoryURL = directoryURL.standardizedFileURL
     }
 
+    /// Writes a draft now, superseding any deferred write still pending for
+    /// the note. The base text is reduced to its digest before it is stored.
     func save(content: String, baseContent: String, for url: URL) throws {
-        try FileManager.default.createDirectory(
-            at: directoryURL,
-            withIntermediateDirectories: true
-        )
-        let draft = RecoveryDraft(
-            sourcePath: url.standardizedFileURL.path,
-            content: content,
-            baseContent: baseContent,
-            updatedAt: Date()
-        )
-        try JSONEncoder().encode(draft).write(to: draftURL(for: url), options: .atomic)
+        try save(content: content, baseContentDigest: RecoveryDraft.digest(of: baseContent), for: url)
+    }
+
+    func save(content: String, baseContentDigest: String, for url: URL) throws {
+        let data = try encodedDraft(content: content, baseContentDigest: baseContentDigest, for: url)
+        try writeGate.supersedeAndRun(keys: [Self.draftKey(for: url)]) {
+            try writeEncodedDraft(data, for: url)
+        }
+    }
+
+    /// Reserves a deferred write for `url`. A later reservation, save, move or
+    /// removal for the same note supersedes it.
+    func reserveDeferredWrite(for url: URL) -> RecoveryDraftWriteTicket {
+        writeGate.reserve(url: url, key: Self.draftKey(for: url))
+    }
+
+    /// Writes the reserved draft unless its ticket has been superseded. Safe
+    /// to call off the main actor; returns whether the draft was written.
+    @discardableResult
+    func save(content: String, baseContent: String, ifCurrent ticket: RecoveryDraftWriteTicket) -> Bool {
+        // Hash and encode before taking the gate, so a large note never
+        // keeps a synchronous save or removal waiting on that work.
+        let digest = RecoveryDraft.digest(of: baseContent)
+        guard let data = try? encodedDraft(content: content, baseContentDigest: digest, for: ticket.url) else {
+            return false
+        }
+        let written = writeGate.runIfCurrent(ticket) {
+            (try? writeEncodedDraft(data, for: ticket.url)) != nil
+        }
+        return written ?? false
     }
 
     func draft(for url: URL) -> RecoveryDraft? {
@@ -129,18 +293,54 @@ struct RecoveryStore: Sendable {
     }
 
     func removeDraft(for url: URL) {
-        try? FileManager.default.removeItem(at: draftURL(for: url))
+        writeGate.supersedeAndRun(keys: [Self.draftKey(for: url)]) {
+            try? FileManager.default.removeItem(at: draftURL(for: url))
+        }
     }
 
     func moveDraft(from oldURL: URL, to newURL: URL) {
-        guard let draft = draft(for: oldURL) else { return }
-        do {
-            try save(content: draft.content, baseContent: draft.baseContent, for: newURL)
-            removeDraft(for: oldURL)
-        } catch {
-            // Recovery is best-effort and must never make the primary rename or
-            // move fail. If this write fails, the old-path draft remains intact.
+        let oldKey = Self.draftKey(for: oldURL)
+        let newKey = Self.draftKey(for: newURL)
+        // Both paths name one draft file; moving it onto itself would delete it.
+        guard oldKey != newKey else { return }
+        writeGate.supersedeAndRun(keys: [oldKey, newKey]) {
+            guard let draft = draft(for: oldURL) else { return }
+            do {
+                let data = try encodedDraft(
+                    content: draft.content,
+                    baseContentDigest: draft.baseContentDigest,
+                    for: newURL
+                )
+                try writeEncodedDraft(data, for: newURL)
+                try? FileManager.default.removeItem(at: draftURL(for: oldURL))
+            } catch {
+                // Recovery is best-effort and must never make the primary rename or
+                // move fail. If this write fails, the old-path draft remains intact.
+            }
         }
+    }
+
+    private func encodedDraft(content: String, baseContentDigest: String, for url: URL) throws -> Data {
+        let draft = RecoveryDraft(
+            sourcePath: url.standardizedFileURL.path,
+            content: content,
+            baseContentDigest: baseContentDigest,
+            updatedAt: Date()
+        )
+        return try JSONEncoder().encode(draft)
+    }
+
+    /// Callers hold the write gate.
+    private func writeEncodedDraft(_ data: Data, for url: URL) throws {
+        try FileManager.default.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true
+        )
+        try data.write(to: draftURL(for: url), options: .atomic)
+    }
+
+    private static func draftKey(for url: URL) -> String {
+        url.standardizedFileURL.path
     }
 
     private func draftURL(for url: URL) -> URL {
@@ -196,9 +396,15 @@ struct SaveConflict: Identifiable, Equatable {
 @Observable
 @MainActor
 final class Workspace {
-    var files: [FileItem] = []
+    var files: [FileItem] = [] {
+        didSet { updateFileLookups(from: oldValue) }
+    }
     var sidebarNodes: [SidebarNode] = []
-    var selectedFileURL: URL?
+    var selectedFileURL: URL? {
+        didSet {
+            selectedFileCanonicalPath = selectedFileURL.map { canonicalPath(for: $0) }
+        }
+    }
     var text: String = "" {
         didSet {
             guard text != oldValue else { return }
@@ -210,10 +416,10 @@ final class Workspace {
     var vaultURL: URL?
     var sortOrder: SortOrder {
         didSet {
-            guard oldValue != sortOrder else { return }
+            guard !isRestoringSortOrder, oldValue != sortOrder else { return }
             persistSortOrder()
             guard vaultURL != nil else { return }
-            refreshFiles()
+            applySortOrderInMemory()
         }
     }
     var isCommandPalettePresented = false
@@ -260,36 +466,63 @@ final class Workspace {
     var assetLookupSnapshot: [String: [URL]] { assetLookupByFilename }
 
     private static let bookmarkKey = "vaultBookmark"
-    private static let editorSelectionKeyPrefix = "editorSelection::"
+    /// One `[canonical path: [location, length]]` dictionary per vault.
+    private static let editorSelectionsKeyPrefix = "editorSelections::"
+    /// Per-note keys written by earlier versions; migrated once per vault,
+    /// then removed.
+    private static let legacyEditorSelectionKeyPrefix = "editorSelection::"
+    /// Per-vault marker (suffixed with the vault path) recording that the
+    /// vault's legacy keys were imported and removed.
+    private static let legacyEditorSelectionsMigratedKeyPrefix = "editorSelectionsLegacyKeysMigrated::"
     private static let noteGraphDebounceNanoseconds: UInt64 = 250_000_000
     private let preferences: AppPreferences
     private let recoveryStore: RecoveryStore
+    private let userDefaults: UserDefaults
     private var activeSecurityScopedVaultURL: URL?
     private var autosaveTask: Task<Void, Never>?
     private var recoveryDraftTask: Task<Void, Never>?
     private var snapshotLoadTask: Task<Void, Never>?
     private var noteGraphRefreshTask: Task<Void, Never>?
     private var externalChangeTask: Task<Void, Never>?
-    private var pendingExternalChanges: [VaultFileChange] = []
+    @ObservationIgnored private var pendingExternalChanges = VaultFileChangeBatch()
     private var vaultFilePresenter: VaultFilePresenter?
     private var snapshotGeneration = 0
     private var noteGraphGeneration = 0
     private var cachedMarkdownMetadataByPath: [String: CachedMarkdownMetadata] = [:]
     private var noteSearchIndex = NoteSearchIndex()
     private var assetLookupByFilename: [String: [URL]] = [:]
-    private var pendingEditorSelectionsByKey: [String: [Int]] = [:]
-    private var editorSelectionPersistTasksByKey: [String: Task<Void, Never>] = [:]
+    /// The open vault's editor selections keyed by canonical path, read from
+    /// defaults once per vault. `editorSelection(for:)` runs while views
+    /// evaluate, so this state stays out of observation tracking.
+    @ObservationIgnored private var editorSelectionsByPath: [String: [Int]] = [:]
+    /// The defaults key `editorSelectionsByPath` belongs to; `nil` while no
+    /// vault is open, when selections are only kept in memory.
+    @ObservationIgnored private var loadedEditorSelectionsKey: String?
+    @ObservationIgnored private var hasLoadedEditorSelections = false
+    @ObservationIgnored private var hasPendingEditorSelectionsWrite = false
+    @ObservationIgnored private var editorSelectionsPersistTask: Task<Void, Never>?
     private var persistedText: String?
     private var isReplacingEditorBuffer = false
+    /// Memoized `FileItem.canonicalPath(for:)` results. Lookups fill it, so
+    /// it must not take part in observation tracking.
+    @ObservationIgnored private var canonicalPathCache: [URL: String] = [:]
+    /// `files` keyed by canonical path, rebuilt in the `files` observer.
+    private var filesByCanonicalPath: [String: FileItem] = [:]
+    @ObservationIgnored private var fileIndexByCanonicalPath: [String: Int] = [:]
+    /// `selectedFileURL`'s canonical path, computed once per selection change.
+    private var selectedFileCanonicalPath: String?
+    @ObservationIgnored private var isRestoringSortOrder = false
 
     init(
         preferences: AppPreferences = AppPreferences(),
-        recoveryStore: RecoveryStore = RecoveryStore()
+        recoveryStore: RecoveryStore = RecoveryStore(),
+        userDefaults: UserDefaults = .standard
     ) {
         self.preferences = preferences
         self.recoveryStore = recoveryStore
+        self.userDefaults = userDefaults
         self.sortOrder = preferences.defaultSortOrder
-        if let data = UserDefaults.standard.data(forKey: Self.bookmarkKey) {
+        if let data = userDefaults.data(forKey: Self.bookmarkKey) {
             restoreVault(from: data)
         }
     }
@@ -315,20 +548,27 @@ final class Workspace {
         persistVaultBookmark(for: url)
         vaultURL = url
         restoreSortOrder()
-        files = []
-        sidebarNodes = []
         selectedFileURL = nil
         replaceEditorBuffer(with: "", persistedContent: nil)
         recoveredDraftURL = nil
-        clearNoteGraph()
-        cachedMarkdownMetadataByPath = [:]
-        assetLookupByFilename = [:]
-        resetSearchIndex()
+        clearInventory()
         refreshFilesInBackground(
             preferredSelectionURL: restoreSelectedFileURL(),
             selectFirstFileIfNeeded: true
         )
         return true
+    }
+
+    /// Drops every loaded directory artifact (inventory, caches, search index
+    /// and graph) ahead of a fresh snapshot.
+    private func clearInventory() {
+        files = []
+        sidebarNodes = []
+        cachedMarkdownMetadataByPath = [:]
+        assetLookupByFilename = [:]
+        canonicalPathCache.removeAll(keepingCapacity: false)
+        resetSearchIndex()
+        clearNoteGraph()
     }
 
     private func restoreVault(from bookmarkData: Data) {
@@ -340,7 +580,7 @@ final class Workspace {
             bookmarkDataIsStale: &isStale
         ) else {
             // Do not leave an expired/corrupt bookmark poisoning every launch.
-            UserDefaults.standard.removeObject(forKey: Self.bookmarkKey)
+            userDefaults.removeObject(forKey: Self.bookmarkKey)
             return
         }
 
@@ -350,25 +590,20 @@ final class Workspace {
                 includingResourceValuesForKeys: nil,
                 relativeTo: nil
             ) else {
-                UserDefaults.standard.removeObject(forKey: Self.bookmarkKey)
+                userDefaults.removeObject(forKey: Self.bookmarkKey)
                 return
             }
-            UserDefaults.standard.set(fresh, forKey: Self.bookmarkKey)
+            userDefaults.set(fresh, forKey: Self.bookmarkKey)
         }
 
         beginAccessingVault(url)
         vaultURL = url
         restoreSortOrder()
 
-        files = []
-        sidebarNodes = []
         selectedFileURL = nil
         replaceEditorBuffer(with: "", persistedContent: nil)
         recoveredDraftURL = nil
-        clearNoteGraph()
-        cachedMarkdownMetadataByPath = [:]
-        assetLookupByFilename = [:]
-        resetSearchIndex()
+        clearInventory()
         refreshFilesInBackground(
             preferredSelectionURL: restoreSelectedFileURL(),
             selectFirstFileIfNeeded: true
@@ -383,12 +618,7 @@ final class Workspace {
         isLoadingSnapshot = false
 
         guard let vaultURL else {
-            files = []
-            sidebarNodes = []
-            cachedMarkdownMetadataByPath = [:]
-            assetLookupByFilename = [:]
-            resetSearchIndex()
-            clearNoteGraph()
+            clearInventory()
             return
         }
 
@@ -397,11 +627,7 @@ final class Workspace {
             sortOrder: sortOrder,
             cachedMarkdownMetadataByPath: cachedMarkdownMetadataByPath
         )
-        cachedMarkdownMetadataByPath = snapshot.markdownMetadataByPath
-        assetLookupByFilename = snapshot.assetLookupByFilename
-        files = snapshot.files
-        sidebarNodes = snapshot.nodes
-        reconcileSearchIndex()
+        applyDirectorySnapshot(snapshot)
 
         if let selectedFileURL {
             if let matchingURL = matchingSidebarURL(for: selectedFileURL) {
@@ -417,7 +643,7 @@ final class Workspace {
     @discardableResult
     func selectFile(_ url: URL) -> Bool {
         let canonicalURL = matchingSidebarURL(for: url) ?? url
-        if let selectedFileURL, Self.urlsMatch(selectedFileURL, canonicalURL) {
+        if let selectedFileURL, urlsMatch(selectedFileURL, canonicalURL) {
             return true
         }
 
@@ -532,7 +758,7 @@ final class Workspace {
     func resolveSaveConflictKeepingMine() {
         guard let conflict = saveConflict else { return }
         let contentToKeep: String
-        if let selectedFileURL, Self.urlsMatch(selectedFileURL, conflict.url) {
+        if let selectedFileURL, urlsMatch(selectedFileURL, conflict.url) {
             contentToKeep = text
         } else {
             contentToKeep = conflict.editorContent
@@ -541,7 +767,7 @@ final class Workspace {
         do {
             try Self.coordinatedWrite(Data(contentToKeep.utf8), to: conflict.url)
             saveError = nil
-            if let selectedFileURL, Self.urlsMatch(selectedFileURL, conflict.url) {
+            if let selectedFileURL, urlsMatch(selectedFileURL, conflict.url) {
                 persistedText = contentToKeep
             }
             recoveryStore.removeDraft(for: conflict.url)
@@ -561,7 +787,7 @@ final class Workspace {
     func resolveSaveConflictUsingDisk() {
         guard let conflict = saveConflict else { return }
         saveConflict = nil
-        if let selectedFileURL, Self.urlsMatch(selectedFileURL, conflict.url) {
+        if let selectedFileURL, urlsMatch(selectedFileURL, conflict.url) {
             replaceEditorBuffer(with: conflict.onDiskContent, persistedContent: conflict.onDiskContent)
             recoveredDraftURL = nil
         }
@@ -595,12 +821,32 @@ final class Workspace {
         recoveryDraftTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(250))
             guard let self, !Task.isCancelled else { return }
-            self.persistRecoveryDraftNow()
+            self.writeRecoveryDraftInBackground()
+        }
+    }
+
+    /// Hands the dirty buffer to a detached write so typing pauses never wait
+    /// on disk. The write's ticket is reserved here, on the main actor: any
+    /// later save, removal, move or newer draft for the note supersedes it,
+    /// so a slow stale write can never replace newer recovery state.
+    private func writeRecoveryDraftInBackground() {
+        guard let selectedFileURL,
+              selectedFileIsMarkdown,
+              let persistedText,
+              persistedText != text else {
+            return
+        }
+        let recoveryStore = recoveryStore
+        let ticket = recoveryStore.reserveDeferredWrite(for: selectedFileURL)
+        let content = text
+        Task.detached(priority: .userInitiated) {
+            recoveryStore.save(content: content, baseContent: persistedText, ifCurrent: ticket)
         }
     }
 
     /// Flushes the current dirty buffer to local recovery immediately. Save
-    /// failure and conflict paths call this synchronously before returning.
+    /// failure and conflict paths call this synchronously before returning;
+    /// the write supersedes any detached draft write still in flight.
     @discardableResult
     func persistRecoveryDraftNow() -> Bool {
         recoveryDraftTask?.cancel()
@@ -627,7 +873,7 @@ final class Workspace {
     @discardableResult
     func restoreRecoveryDraft(for url: URL) -> Bool {
         guard let selectedFileURL,
-              Self.urlsMatch(selectedFileURL, url),
+              urlsMatch(selectedFileURL, url),
               let draft = recoveryStore.draft(for: url) else {
             return false
         }
@@ -682,7 +928,7 @@ final class Workspace {
         replacement: String
     ) -> Bool {
         let standardized = url.resolvingSymlinksInPath().standardizedFileURL
-        if let selectedFileURL, Self.urlsMatch(selectedFileURL, standardized) {
+        if let selectedFileURL, urlsMatch(selectedFileURL, standardized) {
             guard text == expected else { return false }
             text = replacement
             return true
@@ -702,7 +948,8 @@ final class Workspace {
     func deleteItem(_ url: URL) {
         let itemURL = matchingSidebarURL(for: url) ?? url.resolvingSymlinksInPath().standardizedFileURL
         let isDirectory = isDirectoryURL(itemURL)
-        let editorSelectionKeysToClear = editorSelectionKeys(forDeletedItemAt: itemURL, isDirectory: isDirectory)
+        // Resolved before trashing, while the item's path still resolves.
+        let selectionRootPaths = editorSelectionRootPaths(for: itemURL)
         let shouldClearSelectedFile = selectedFileURL.map {
             deletedItem(itemURL, isDirectory: isDirectory, contains: $0)
         } ?? false
@@ -716,7 +963,7 @@ final class Workspace {
             return
         }
 
-        clearStoredEditorSelections(forKeys: editorSelectionKeysToClear)
+        removeStoredEditorSelections(underRootPaths: selectionRootPaths)
 
         if shouldClearSelectedFile {
             if let selectedFileURL {
@@ -806,6 +1053,12 @@ final class Workspace {
         beginAccessingVault(parentURL)
         persistVaultBookmark(for: parentURL)
 
+        if vaultURL?.standardizedFileURL != parentURL.standardizedFileURL {
+            // Switching vaults drops the previous inventory instead of walking
+            // the new directory synchronously; the background refresh below
+            // rebuilds it while the opened note is already visible.
+            clearInventory()
+        }
         vaultURL = parentURL
         restoreSortOrder()
 
@@ -889,6 +1142,7 @@ final class Workspace {
             to: destinationURL,
             sourceIsDirectory: sourceIsDirectory
         )
+        let selectionRootPaths = editorSelectionRootPaths(for: standardizedSourceURL)
 
         guard (try? FileManager.default.moveItem(at: standardizedSourceURL, to: destinationURL)) != nil else {
             return false
@@ -900,11 +1154,7 @@ final class Workspace {
             recoveryStore.moveDraft(from: oldSelectedFileURL, to: selectedURLAfterMove)
         }
 
-        moveStoredEditorSelections(
-            from: standardizedSourceURL,
-            to: destinationURL,
-            sourceIsDirectory: sourceIsDirectory
-        )
+        moveStoredEditorSelections(fromRootPaths: selectionRootPaths, to: destinationURL)
         applyLinkRefactorEdits(linkRefactorEdits, operationName: "move")
         refreshFiles()
         return true
@@ -916,7 +1166,7 @@ final class Workspace {
         guard newURL != url else { return url }
 
         let sourceIsDirectory = isDirectoryURL(url)
-        let isSelectedFile = selectedFileURL.map { Self.urlsMatch($0, url) } ?? false
+        let isSelectedFile = selectedFileURL.map { urlsMatch($0, url) } ?? false
         let selectedURLAfterRename = selectedFileURL.flatMap {
             remappedURL($0, from: url, to: newURL, sourceIsDirectory: sourceIsDirectory)
         }
@@ -943,6 +1193,7 @@ final class Workspace {
             sourceIsDirectory: sourceIsDirectory,
             bodyOverrides: bodyOverrides
         )
+        let selectionRootPaths = editorSelectionRootPaths(for: url)
 
         try moveItemForRename(at: url, to: newURL)
 
@@ -951,11 +1202,7 @@ final class Workspace {
             persistSelectedFileURL(selectedURLAfterRename)
             recoveryStore.moveDraft(from: oldSelectedFileURL, to: selectedURLAfterRename)
         }
-        moveStoredEditorSelections(
-            from: url,
-            to: newURL,
-            sourceIsDirectory: sourceIsDirectory
-        )
+        moveStoredEditorSelections(fromRootPaths: selectionRootPaths, to: newURL)
 
         if let existingContent, let updatedContent {
             if updatedContent != existingContent {
@@ -981,13 +1228,34 @@ final class Workspace {
         bodyOverrides: [URL: String] = [:]
     ) -> [VaultLinkRefactorEdit] {
         guard let vaultURL else { return [] }
+        let liveSelectedBody = selectedFileIsMarkdown ? text : nil
         let notes = files.compactMap { file -> VaultLinkNoteSnapshot? in
             let standardizedURL = file.url.standardizedFileURL
-            guard let body = bodyOverrides[standardizedURL] ?? noteBody(for: standardizedURL) else {
+            if let override = bodyOverrides[standardizedURL] {
+                return VaultLinkNoteSnapshot(
+                    url: standardizedURL,
+                    body: override,
+                    aliases: Self.aliases(in: override)
+                )
+            }
+            if let liveSelectedBody, file.canonicalPath == selectedFileCanonicalPath {
+                return VaultLinkNoteSnapshot(
+                    url: standardizedURL,
+                    body: liveSelectedBody,
+                    aliases: Self.aliases(in: liveSelectedBody)
+                )
+            }
+            // Cached bodies carry their parsed frontmatter, so aliases come
+            // from the shared metadata instead of a fresh parse per note.
+            let metadataKey = Self.metadataCacheKey(for: standardizedURL)
+            guard let storage = cachedMarkdownMetadataByPath[metadataKey]?.noteBodyStorage else {
                 return nil
             }
-            let aliases = ObsidianMetadataParser.parse(body).aliases
-            return VaultLinkNoteSnapshot(url: standardizedURL, body: body, aliases: aliases)
+            return VaultLinkNoteSnapshot(
+                url: standardizedURL,
+                body: storage.text,
+                aliases: ObsidianMetadataParser.aliases(in: storage.searchMetadata.properties)
+            )
         }
         let assetURLs = Set(assetLookupByFilename.values.flatMap { $0 }.map {
             $0.resolvingSymlinksInPath().standardizedFileURL
@@ -1002,6 +1270,10 @@ final class Workspace {
         )
     }
 
+    private nonisolated static func aliases(in body: String) -> [String] {
+        ObsidianMetadataParser.aliases(in: ObsidianMetadataParser.searchMetadata(in: body).properties)
+    }
+
     private func applyLinkRefactorEdits(
         _ edits: [VaultLinkRefactorEdit],
         operationName: String
@@ -1011,7 +1283,7 @@ final class Workspace {
             try VaultLinkRefactor.apply(edits)
             if let selectedFileURL,
                let selectedEdit = edits.first(where: {
-                   Self.urlsMatch($0.destinationURL, selectedFileURL)
+                   urlsMatch($0.destinationURL, selectedFileURL)
                }) {
                 replaceEditorBuffer(
                     with: selectedEdit.updatedBody,
@@ -1024,21 +1296,17 @@ final class Workspace {
         }
     }
 
+    // MARK: - Editor Selections
+
     func persistEditorSelection(_ selection: NSRange, for url: URL?) {
         guard let url else { return }
 
-        let storageKey = editorSelectionStorageKey(for: url)
+        loadEditorSelectionsIfNeeded()
+        let path = canonicalPath(for: url)
         let sanitizedSelection = [max(0, selection.location), max(0, selection.length)]
-        pendingEditorSelectionsByKey[storageKey] = sanitizedSelection
-        editorSelectionPersistTasksByKey[storageKey]?.cancel()
-        editorSelectionPersistTasksByKey[storageKey] = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(150))
-            guard let self, !Task.isCancelled else { return }
-            guard self.pendingEditorSelectionsByKey[storageKey] == sanitizedSelection else { return }
-            UserDefaults.standard.set(sanitizedSelection, forKey: storageKey)
-            self.pendingEditorSelectionsByKey.removeValue(forKey: storageKey)
-            self.editorSelectionPersistTasksByKey.removeValue(forKey: storageKey)
-        }
+        guard editorSelectionsByPath[path] != sanitizedSelection else { return }
+        editorSelectionsByPath[path] = sanitizedSelection
+        scheduleEditorSelectionsPersist()
     }
 
     func editorSelection(for url: URL?) -> NSRange? {
@@ -1046,9 +1314,9 @@ final class Workspace {
             return nil
         }
 
-        let storageKey = editorSelectionStorageKey(for: url)
-        let persistedSelection = (pendingEditorSelectionsByKey[storageKey] ?? UserDefaults.standard.array(forKey: storageKey) as? [Int]) ?? []
-        guard persistedSelection.count == 2 else {
+        loadEditorSelectionsIfNeeded()
+        guard let persistedSelection = editorSelectionsByPath[canonicalPath(for: url)],
+              persistedSelection.count == 2 else {
             return nil
         }
 
@@ -1058,24 +1326,281 @@ final class Workspace {
         )
     }
 
+    private var editorSelectionsStorageKey: String? {
+        guard let vaultURL else { return nil }
+        return Self.editorSelectionsKeyPrefix + vaultURL.standardizedFileURL.path
+    }
+
+    /// Reads the open vault's selections the first time they are needed after
+    /// the vault changed, writing back the previous vault's selections first.
+    private func loadEditorSelectionsIfNeeded() {
+        let storageKey = editorSelectionsStorageKey
+        guard !hasLoadedEditorSelections || storageKey != loadedEditorSelectionsKey else { return }
+
+        flushEditorSelections()
+        hasLoadedEditorSelections = true
+        loadedEditorSelectionsKey = storageKey
+        guard let storageKey else {
+            editorSelectionsByPath = [:]
+            return
+        }
+        editorSelectionsByPath = Self.decodedEditorSelections(userDefaults.dictionary(forKey: storageKey))
+        migrateLegacyEditorSelectionsIfNeeded()
+    }
+
+    private nonisolated static func decodedEditorSelections(_ dictionary: [String: Any]?) -> [String: [Int]] {
+        guard let dictionary else { return [:] }
+        return dictionary.compactMapValues { value in
+            guard let selection = value as? [Int], selection.count == 2 else { return nil }
+            return selection
+        }
+    }
+
+    /// Earlier versions stored one `editorSelection::<path>` key per note and
+    /// never pruned them. Once per vault, the entries inside the loaded
+    /// vault's roots are imported and removed. Keys outside those roots
+    /// belong to other vaults and stay until those vaults are opened.
+    private func migrateLegacyEditorSelectionsIfNeeded() {
+        guard let vaultURL else { return }
+        let migratedKey = Self.legacyEditorSelectionsMigratedKeyPrefix + vaultURL.standardizedFileURL.path
+        guard !userDefaults.bool(forKey: migratedKey) else { return }
+        userDefaults.set(true, forKey: migratedKey)
+
+        let prefix = Self.legacyEditorSelectionKeyPrefix
+        let vaultRootPaths = editorSelectionRootPaths(for: vaultURL)
+        var didImport = false
+        for (key, value) in userDefaults.dictionaryRepresentation() where key.hasPrefix(prefix) {
+            let path = String(key.dropFirst(prefix.count))
+            guard Self.pathSuffix(of: path, underAnyOf: vaultRootPaths) != nil else { continue }
+            userDefaults.removeObject(forKey: key)
+            guard editorSelectionsByPath[path] == nil,
+                  let selection = value as? [Int],
+                  selection.count == 2 else {
+                continue
+            }
+            editorSelectionsByPath[path] = selection
+            didImport = true
+        }
+        if didImport {
+            hasPendingEditorSelectionsWrite = true
+            flushEditorSelections()
+        }
+    }
+
+    private func scheduleEditorSelectionsPersist() {
+        hasPendingEditorSelectionsWrite = true
+        editorSelectionsPersistTask?.cancel()
+        editorSelectionsPersistTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(150))
+            guard let self, !Task.isCancelled else { return }
+            self.flushEditorSelections()
+        }
+    }
+
+    /// Writes the in-memory selections back to the key they were read from.
+    private func flushEditorSelections() {
+        editorSelectionsPersistTask?.cancel()
+        editorSelectionsPersistTask = nil
+        guard hasPendingEditorSelectionsWrite else { return }
+        hasPendingEditorSelectionsWrite = false
+        guard let loadedEditorSelectionsKey else { return }
+        if editorSelectionsByPath.isEmpty {
+            userDefaults.removeObject(forKey: loadedEditorSelectionsKey)
+        } else {
+            userDefaults.set(editorSelectionsByPath, forKey: loadedEditorSelectionsKey)
+        }
+    }
+
+    /// The spellings under which selections inside `url` may be recorded:
+    /// its canonical and its standardized path. Callers resolve them before
+    /// moving or trashing the item, while the item's own path still resolves.
+    private func editorSelectionRootPaths(for url: URL) -> Set<String> {
+        [canonicalPath(for: url), url.standardizedFileURL.path]
+    }
+
+    /// Re-keys the selections stored for an item, or anything inside it, to
+    /// the item's new location. Only the in-memory dictionary is scanned.
+    private func moveStoredEditorSelections(fromRootPaths oldRootPaths: Set<String>, to newRootURL: URL) {
+        loadEditorSelectionsIfNeeded()
+        guard !editorSelectionsByPath.isEmpty else { return }
+
+        var movedSelections: [(oldPath: String, suffix: String, selection: [Int])] = []
+        for (path, selection) in editorSelectionsByPath {
+            guard let suffix = Self.pathSuffix(of: path, underAnyOf: oldRootPaths) else { continue }
+            movedSelections.append((path, suffix, selection))
+        }
+        guard !movedSelections.isEmpty else { return }
+
+        let newRootPath = canonicalPath(for: newRootURL)
+        for moved in movedSelections {
+            editorSelectionsByPath.removeValue(forKey: moved.oldPath)
+        }
+        for moved in movedSelections {
+            editorSelectionsByPath[newRootPath + moved.suffix] = moved.selection
+        }
+        hasPendingEditorSelectionsWrite = true
+        flushEditorSelections()
+    }
+
+    private func removeStoredEditorSelections(underRootPaths rootPaths: Set<String>) {
+        loadEditorSelectionsIfNeeded()
+        let removedPaths = editorSelectionsByPath.keys.filter {
+            Self.pathSuffix(of: $0, underAnyOf: rootPaths) != nil
+        }
+        guard !removedPaths.isEmpty else { return }
+
+        for path in removedPaths {
+            editorSelectionsByPath.removeValue(forKey: path)
+        }
+        hasPendingEditorSelectionsWrite = true
+        flushEditorSelections()
+    }
+
+    /// Drops selections of notes missing from a freshly applied snapshot, so
+    /// the stored dictionary only ever holds notes that still exist. Nothing
+    /// is pruned for an empty inventory (an unreadable or briefly unavailable
+    /// vault), for a snapshot whose walk could not list every directory
+    /// (its inventory is partial), or for selections outside the vault's
+    /// roots (notes opened through a symlinked folder or from elsewhere,
+    /// which the walk never inventories).
+    private func pruneStoredEditorSelections(snapshotIsComplete: Bool) {
+        guard snapshotIsComplete, let vaultURL else { return }
+        loadEditorSelectionsIfNeeded()
+        guard !editorSelectionsByPath.isEmpty, !files.isEmpty else { return }
+
+        let vaultRootPaths = editorSelectionRootPaths(for: vaultURL)
+        let stalePaths = editorSelectionsByPath.keys.filter {
+            filesByCanonicalPath[$0] == nil
+                && Self.pathSuffix(of: $0, underAnyOf: vaultRootPaths) != nil
+        }
+        guard !stalePaths.isEmpty else { return }
+
+        for path in stalePaths {
+            editorSelectionsByPath.removeValue(forKey: path)
+        }
+        hasPendingEditorSelectionsWrite = true
+        flushEditorSelections()
+    }
+
+    /// `""` when `path` is one of `roots`, `"/rest"` when it lies inside one
+    /// of them, and `nil` otherwise.
+    private nonisolated static func pathSuffix(of path: String, underAnyOf roots: Set<String>) -> String? {
+        for root in roots {
+            if path == root {
+                return ""
+            }
+            let rootPrefix = root.hasSuffix("/") ? root : root + "/"
+            if path.hasPrefix(rootPrefix) {
+                return "/" + String(path.dropFirst(rootPrefix.count))
+            }
+        }
+        return nil
+    }
+
     func title(for file: FileItem) -> String {
-        if let selectedFileURL, Self.urlsMatch(file.url, selectedFileURL),
+        // `selectedFileURL` is read so observers keep tracking the selection.
+        if selectedFileURL != nil, file.canonicalPath == selectedFileCanonicalPath,
            let liveTitle = Self.extractTitle(from: text) {
             return liveTitle
         }
         return file.sidebarTitle
     }
 
+    /// O(1): one memoized canonical-path lookup plus a dictionary read.
     func fileItem(for url: URL) -> FileItem? {
-        files.first(where: { Self.urlsMatch($0.url, url) })
+        guard !files.isEmpty else { return nil }
+        return filesByCanonicalPath[canonicalPath(for: url)]
+    }
+
+    /// Symlink-insensitive identity for `url`. Resolving symlinks costs tens
+    /// of microseconds, so results are memoized; the cache is seeded from
+    /// `files`, cleared with every directory snapshot and bounded so stray
+    /// URLs (stored selections, drops) cannot grow it without limit.
+    func canonicalPath(for url: URL) -> String {
+        if let cached = canonicalPathCache[url] {
+            return cached
+        }
+        let path = FileItem.canonicalPath(for: url)
+        if canonicalPathCache.count >= 4 * files.count + 1000 {
+            canonicalPathCache.removeAll(keepingCapacity: true)
+            for file in files {
+                canonicalPathCache[file.url] = file.canonicalPath
+            }
+        }
+        canonicalPathCache[url] = path
+        return path
+    }
+
+    /// Symlink-insensitive URL equality backed by `canonicalPath(for:)`.
+    private func urlsMatch(_ lhs: URL, _ rhs: URL) -> Bool {
+        canonicalPath(for: lhs) == canonicalPath(for: rhs)
+    }
+
+    /// Keeps the canonical-path dictionaries in step with `files`. A record
+    /// refreshed in place (the common autosave case) only touches its own
+    /// dictionary value; any other change rebuilds both lookups.
+    private func updateFileLookups(from previousFiles: [FileItem]) {
+        guard previousFiles.count == files.count else {
+            rebuildFileLookups()
+            return
+        }
+        for index in files.indices where files[index].canonicalPath != previousFiles[index].canonicalPath {
+            rebuildFileLookups()
+            return
+        }
+        for index in files.indices where files[index] != previousFiles[index] {
+            let file = files[index]
+            // Symlinked notes can share a canonical path; the first file in
+            // `files` order stays the lookup result, as `first(where:)` did.
+            if fileIndexByCanonicalPath[file.canonicalPath] == index {
+                filesByCanonicalPath[file.canonicalPath] = file
+            }
+            canonicalPathCache[file.url] = file.canonicalPath
+        }
+        // A memo cleared for a new snapshot is re-seeded even when no record
+        // changed, so note URLs never fall back to resolving symlinks.
+        if canonicalPathCache.count < files.count {
+            for file in files {
+                canonicalPathCache[file.url] = file.canonicalPath
+            }
+        }
+    }
+
+    private func rebuildFileLookups() {
+        var byPath: [String: FileItem] = [:]
+        var indexByPath: [String: Int] = [:]
+        byPath.reserveCapacity(files.count)
+        indexByPath.reserveCapacity(files.count)
+        for (index, file) in files.enumerated() {
+            if indexByPath[file.canonicalPath] == nil {
+                byPath[file.canonicalPath] = file
+                indexByPath[file.canonicalPath] = index
+            }
+            canonicalPathCache[file.url] = file.canonicalPath
+        }
+        filesByCanonicalPath = byPath
+        fileIndexByCanonicalPath = indexByPath
+    }
+
+    /// Re-sorts the loaded inventory for a user-initiated sort change. The
+    /// directory contents are unchanged, so there is no disk walk and no
+    /// note-graph rebuild; the search index follows because its result order
+    /// mirrors `files`.
+    private func applySortOrderInMemory() {
+        files = Self.sortFileItems(files, sortOrder: sortOrder)
+        sidebarNodes = Self.sortSidebarNodesRecursively(sidebarNodes, sortOrder: sortOrder)
+        reconcileSearchIndex()
     }
 
     func relativePath(for file: FileItem) -> String? {
-        guard let vaultURL else {
+        relativePath(for: file, vaultBasePath: vaultURL?.standardizedFileURL.path)
+    }
+
+    private func relativePath(for file: FileItem, vaultBasePath: String?) -> String? {
+        guard let basePath = vaultBasePath else {
             return file.name == file.displayName ? nil : file.name
         }
 
-        let basePath = vaultURL.standardizedFileURL.path
         let filePath = file.url.standardizedFileURL.path
         guard filePath.hasPrefix(basePath) else {
             return file.name == file.displayName ? nil : file.name
@@ -1162,6 +1687,10 @@ final class Workspace {
         let vaultURL = vaultURL
         let selectedFileURL = selectedFileURL
         let liveSelectedMarkdown = selectedFileIsMarkdown ? text : nil
+        // `noteGraph` only changes together with `noteGraphGeneration`, so
+        // the generation check below guarantees this is still the live graph
+        // when the rebuilt snapshot is compared against it.
+        let previousGraph = noteGraph
 
         noteGraphRefreshTask = Task { [weak self] in
             if delay > 0 {
@@ -1169,20 +1698,23 @@ final class Workspace {
             }
             guard !Task.isCancelled else { return }
 
-            let snapshot = await Task.detached(priority: .utility) {
-                NoteGraphBuilder.makeSnapshot(
+            let changedSnapshot = await Task.detached(priority: .utility) { () -> NoteGraphSnapshot? in
+                let snapshot = NoteGraphBuilder.makeSnapshot(
                     files: files,
                     metadataByPath: metadataByPath,
                     vaultURL: vaultURL,
                     selectedFileURL: selectedFileURL,
                     liveSelectedMarkdown: liveSelectedMarkdown
                 )
+                // An identical graph (an autosave that changed no links) is
+                // dropped here so graph observers are not invalidated for it.
+                return snapshot == previousGraph ? nil : snapshot
             }.value
 
             guard !Task.isCancelled else { return }
             await MainActor.run {
-                guard let self, generation == self.noteGraphGeneration else { return }
-                self.noteGraph = snapshot
+                guard let self, generation == self.noteGraphGeneration, let changedSnapshot else { return }
+                self.noteGraph = changedSnapshot
             }
         }
     }
@@ -1191,22 +1723,22 @@ final class Workspace {
     /// Returns the live editor contents when the URL is the selected file
     /// so search reflects unsaved edits.
     func noteBody(for url: URL) -> String? {
-        let standardized = url.resolvingSymlinksInPath().standardizedFileURL
-        if let selectedFileURL,
-           Self.urlsMatch(selectedFileURL, standardized),
+        let canonical = canonicalPath(for: url)
+        if selectedFileURL != nil,
+           canonical == selectedFileCanonicalPath,
            selectedFileIsMarkdown {
             return text
         }
-        let key = Self.metadataCacheKey(for: standardized)
-        return cachedMarkdownMetadataByPath[key]?.noteBody
+        return cachedMarkdownMetadataByPath[canonical]?.noteBody
     }
 
     /// Returns a cheap snapshot of the maintained index. Complete note bodies
     /// remain shared, so opening the palette does not retain a duplicate vault.
     func makeSearchEntries() -> [NoteSearchEntry] {
         var entries = noteSearchIndex.entries
-        guard let selectedFileURL, selectedFileIsMarkdown,
-              let index = entries.firstIndex(where: { Self.urlsMatch($0.url, selectedFileURL) }),
+        guard selectedFileURL != nil, selectedFileIsMarkdown,
+              let selectedPath = selectedFileCanonicalPath,
+              let index = searchEntryIndex(forCanonicalPath: selectedPath, in: entries),
               entries[index].body != text else {
             return entries
         }
@@ -1225,26 +1757,73 @@ final class Workspace {
         return entries
     }
 
+    /// Index records follow `files` order, so the selected note is normally
+    /// at the same position; the scan is only a fallback for stale snapshots.
+    private func searchEntryIndex(forCanonicalPath path: String, in entries: [NoteSearchEntry]) -> Int? {
+        if let index = fileIndexByCanonicalPath[path],
+           entries.indices.contains(index),
+           canonicalPath(for: entries[index].url) == path {
+            return index
+        }
+        return entries.firstIndex { canonicalPath(for: $0.url) == path }
+    }
+
     private func reconcileSearchIndex() {
+        let vaultBasePath = vaultURL?.standardizedFileURL.path
         let candidates = files.map { file in
-            let title = title(for: file)
-            let haystack = "\(title)\n\(file.displayName)\n\(file.name)"
             let metadataKey = Self.metadataCacheKey(for: file.url)
-            let bodyStorage = cachedMarkdownMetadataByPath[metadataKey]?.noteBodyStorage
-                ?? SearchableNoteBody("")
-            return NoteSearchEntry(
-                id: file.id,
-                url: file.url,
-                title: title,
-                relativePath: relativePath(for: file),
-                bodyStorage: bodyStorage,
-                foldedTitle: Self.foldedForSearch(title),
-                foldedTitleHaystack: Self.foldedForSearch(haystack)
+            return makeSearchEntry(
+                for: file,
+                metadataKey: metadataKey,
+                reusing: noteSearchIndex.entry(forPath: metadataKey),
+                vaultBasePath: vaultBasePath
             )
         }
         if noteSearchIndex.reconcile(candidates) {
             searchIndexRevision &+= 1
         }
+    }
+
+    /// Builds the index record for `file`. When `existing` has the same
+    /// title, relative path and body storage, its folded strings are reused
+    /// so reconciling after an unrelated change does not re-fold every note.
+    private func makeSearchEntry(
+        for file: FileItem,
+        metadataKey: String,
+        reusing existing: NoteSearchEntry?,
+        vaultBasePath: String?
+    ) -> NoteSearchEntry {
+        let title = title(for: file)
+        let relativePath = relativePath(for: file, vaultBasePath: vaultBasePath)
+        let bodyStorage = cachedMarkdownMetadataByPath[metadataKey]?.noteBodyStorage
+            ?? SearchableNoteBody("")
+
+        if let existing,
+           existing.url == file.url,
+           existing.title == title,
+           existing.relativePath == relativePath,
+           existing.bodyStorage === bodyStorage {
+            return NoteSearchEntry(
+                id: file.id,
+                url: file.url,
+                title: title,
+                relativePath: relativePath,
+                bodyStorage: bodyStorage,
+                foldedTitle: existing.foldedTitle,
+                foldedTitleHaystack: existing.foldedTitleHaystack
+            )
+        }
+
+        let haystack = "\(title)\n\(file.displayName)\n\(file.name)"
+        return NoteSearchEntry(
+            id: file.id,
+            url: file.url,
+            title: title,
+            relativePath: relativePath,
+            bodyStorage: bodyStorage,
+            foldedTitle: Self.foldedForSearch(title),
+            foldedTitleHaystack: Self.foldedForSearch(haystack)
+        )
     }
 
     private func resetSearchIndex() {
@@ -1268,6 +1847,17 @@ final class Workspace {
     /// for large vaults. Title/name matches rank above body matches; body
     /// matches carry a centered snippet for context.
     nonisolated static func search(_ entries: [NoteSearchEntry], query rawQuery: String) -> [NoteSearchResult] {
+        search(entries, query: rawQuery, maximumConcurrency: ProcessInfo.processInfo.activeProcessorCount)
+    }
+
+    /// `maximumConcurrency` caps how many chunks of `entries` are scanned in
+    /// parallel; `1` forces the sequential scan. Every value yields identical
+    /// results in identical order, because ranking uses global indices.
+    nonisolated static func search(
+        _ entries: [NoteSearchEntry],
+        query rawQuery: String,
+        maximumConcurrency: Int
+    ) -> [NoteSearchResult] {
         let trimmedQuery = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedQuery.isEmpty else {
             return entries.map {
@@ -1276,13 +1866,86 @@ final class Workspace {
         }
 
         let foldedQuery = foldedForSearch(trimmedQuery)
-        var titleMatches: [(rank: Int, sourceIndex: Int, result: NoteSearchResult)] = []
-        var bodyMatches: [NoteSearchResult] = []
+        let chunkCount = searchChunkCount(entryCount: entries.count, maximumConcurrency: maximumConcurrency)
+        let chunks: [SearchChunkMatches?]
 
-        for (sourceIndex, entry) in entries.enumerated() {
-            if sourceIndex.isMultiple(of: 32), Task.isCancelled {
-                return []
+        if chunkCount <= 1 {
+            chunks = [
+                scanSearchChunk(
+                    entries[...],
+                    foldedQuery: foldedQuery,
+                    trimmedQuery: trimmedQuery,
+                    isCancelled: { Task.isCancelled }
+                )
+            ]
+        } else {
+            // `concurrentPerform` workers run outside the calling task, so
+            // they observe cancellation through a probe on that task. The
+            // probe never outlives this closure.
+            chunks = withUnsafeCurrentTask { currentTask -> [SearchChunkMatches?] in
+                let probe = TaskCancellationProbe(task: currentTask)
+                let buffer = ConcurrentResultBuffer<SearchChunkMatches>(count: chunkCount)
+                let chunkSize = (entries.count + chunkCount - 1) / chunkCount
+                DispatchQueue.concurrentPerform(iterations: chunkCount) { chunkIndex in
+                    let start = chunkIndex * chunkSize
+                    let end = min(entries.count, start + chunkSize)
+                    guard start < end else {
+                        buffer.set(SearchChunkMatches(), at: chunkIndex)
+                        return
+                    }
+                    if let matches = scanSearchChunk(
+                        entries[start..<end],
+                        foldedQuery: foldedQuery,
+                        trimmedQuery: trimmedQuery,
+                        isCancelled: { probe.isCancelled }
+                    ) {
+                        buffer.set(matches, at: chunkIndex)
+                    }
+                }
+                return buffer.elements
             }
+        }
+
+        var titleMatches: [SearchTitleMatch] = []
+        var bodyMatches: [NoteSearchResult] = []
+        for chunk in chunks {
+            // A missing chunk was cancelled; the sequential scan returned [].
+            guard let chunk else { return [] }
+            titleMatches.append(contentsOf: chunk.titleMatches)
+            bodyMatches.append(contentsOf: chunk.bodyMatches)
+        }
+
+        let rankedTitleMatches = titleMatches
+            .sorted {
+                if $0.rank != $1.rank { return $0.rank < $1.rank }
+                return $0.sourceIndex < $1.sourceIndex
+            }
+            .map(\.result)
+        return rankedTitleMatches + bodyMatches
+    }
+
+    private nonisolated static func searchChunkCount(entryCount: Int, maximumConcurrency: Int) -> Int {
+        let parallelThreshold = 512
+        let minimumChunkSize = 256
+        guard entryCount >= parallelThreshold, maximumConcurrency > 1 else { return 1 }
+        return max(1, min(maximumConcurrency, entryCount / minimumChunkSize))
+    }
+
+    /// Scans one slice. Indices are the global `entries` indices, so ranking
+    /// is chunk-independent. Returns `nil` when cancellation was observed.
+    private nonisolated static func scanSearchChunk(
+        _ entries: ArraySlice<NoteSearchEntry>,
+        foldedQuery: String,
+        trimmedQuery: String,
+        isCancelled: () -> Bool
+    ) -> SearchChunkMatches? {
+        var matches = SearchChunkMatches()
+
+        for sourceIndex in entries.indices {
+            if sourceIndex.isMultiple(of: 32), isCancelled() {
+                return nil
+            }
+            let entry = entries[sourceIndex]
             if entry.foldedTitleHaystack.contains(foldedQuery) {
                 let rank: Int
                 if entry.foldedTitle == foldedQuery {
@@ -1294,8 +1957,8 @@ final class Workspace {
                 } else {
                     rank = 3
                 }
-                titleMatches.append(
-                    (
+                matches.titleMatches.append(
+                    SearchTitleMatch(
                         rank: rank,
                         sourceIndex: sourceIndex,
                         result: NoteSearchResult(
@@ -1308,7 +1971,7 @@ final class Workspace {
                     )
                 )
             } else if entry.bodyStorage.foldedText.contains(foldedQuery) {
-                bodyMatches.append(
+                matches.bodyMatches.append(
                     NoteSearchResult(
                         id: entry.id,
                         url: entry.url,
@@ -1324,13 +1987,7 @@ final class Workspace {
             }
         }
 
-        let rankedTitleMatches = titleMatches
-            .sorted {
-                if $0.rank != $1.rank { return $0.rank < $1.rank }
-                return $0.sourceIndex < $1.sourceIndex
-            }
-            .map(\.result)
-        return rankedTitleMatches + bodyMatches
+        return matches
     }
 
     /// Returns a single-line, match-centered snippet, or `nil` if `query` is not
@@ -1413,7 +2070,7 @@ final class Workspace {
         // Automatic recovery is safe only if the file is still the exact base
         // the unsaved edits were made against. A divergent draft remains on
         // disk for explicit recovery instead of overwriting external changes.
-        guard draft.baseContent == diskContent else {
+        guard draft.isBased(on: diskContent) else {
             recoveredDraftURL = nil
             return diskContent
         }
@@ -1461,7 +2118,7 @@ final class Workspace {
     ) -> URL? {
         let candidate = candidateURL.standardizedFileURL
         let source = sourceURL.standardizedFileURL
-        if Self.urlsMatch(candidate, source) {
+        if urlsMatch(candidate, source) {
             return destinationURL.standardizedFileURL
         }
 
@@ -1621,18 +2278,59 @@ final class Workspace {
             noteBodyStorage: SearchableNoteBody(content)
         )
 
-        guard let index = files.firstIndex(where: { Self.urlsMatch($0.url, standardizedURL) }) else { return }
+        let canonical = canonicalPath(for: standardizedURL)
+        guard let index = fileIndexByCanonicalPath[canonical], files.indices.contains(index) else { return }
 
-        files[index] = FileItem(
+        let updatedFile = FileItem(
             id: standardizedURL,
             name: standardizedURL.lastPathComponent,
             url: standardizedURL,
             modificationDate: date,
-            noteTitle: noteTitle
+            noteTitle: noteTitle,
+            canonicalPath: canonical
         )
-        resortFiles()
-        reconcileSearchIndex()
+        files[index] = updatedFile
+
+        // Name order cannot change on save; date order only moves this file.
+        // Unless its position moved, the index needs just this one record.
+        var needsFullReconcile = false
+        if sortOrder == .byDate {
+            resortFiles()
+            needsFullReconcile = fileIndexByCanonicalPath[canonical] != index
+        }
+
+        if !needsFullReconcile, let existingEntry = noteSearchIndex.entry(forPath: metadataKey) {
+            let candidate = makeSearchEntry(
+                for: updatedFile,
+                metadataKey: metadataKey,
+                reusing: existingEntry,
+                vaultBasePath: vaultURL?.standardizedFileURL.path
+            )
+            if noteSearchIndex.update(candidate) {
+                searchIndexRevision &+= 1
+            }
+        } else {
+            reconcileSearchIndex()
+        }
         refreshNoteGraph()
+    }
+
+    private func applyDirectorySnapshot(_ snapshot: DirectorySnapshot) {
+        cachedMarkdownMetadataByPath = snapshot.markdownMetadataByPath
+        assetLookupByFilename = snapshot.assetLookupByFilename
+        // Symlink layout may have changed; `files` re-seeds the memo.
+        canonicalPathCache.removeAll(keepingCapacity: true)
+        if snapshot.sortOrder == sortOrder {
+            files = snapshot.files
+            sidebarNodes = snapshot.nodes
+        } else {
+            // The sort order changed while a background walk was running; the
+            // walk sorted by the order it started with.
+            files = Self.sortFileItems(snapshot.files, sortOrder: sortOrder)
+            sidebarNodes = Self.sortSidebarNodesRecursively(snapshot.nodes, sortOrder: sortOrder)
+        }
+        reconcileSearchIndex()
+        pruneStoredEditorSelections(snapshotIsComplete: snapshot.isComplete)
     }
 
     private func refreshFilesInBackground(
@@ -1644,15 +2342,10 @@ final class Workspace {
 
         guard let vaultURL else {
             isLoadingSnapshot = false
-            files = []
-            sidebarNodes = []
             selectedFileURL = nil
             replaceEditorBuffer(with: "", persistedContent: nil)
             recoveredDraftURL = nil
-            cachedMarkdownMetadataByPath = [:]
-            assetLookupByFilename = [:]
-            resetSearchIndex()
-            clearNoteGraph()
+            clearInventory()
             return
         }
 
@@ -1662,27 +2355,36 @@ final class Workspace {
         let cachedMarkdownMetadataByPath = cachedMarkdownMetadataByPath
 
         snapshotLoadTask = Task { [vaultURL] in
-            let snapshot = await Task.detached(priority: .userInitiated) {
-                Self.snapshotDirectory(
+            let walk = Task.detached(priority: .userInitiated) {
+                Self.snapshotDirectoryObservingCancellation(
                     at: vaultURL,
                     sortOrder: sortOrder,
                     cachedMarkdownMetadataByPath: cachedMarkdownMetadataByPath
                 )
-            }.value
+            }
+            // A superseding refresh cancels this task. Forwarding that to the
+            // walk stops it early, so bursts of external changes handled in
+            // batches cannot pile up full-vault walks whose results would be
+            // discarded anyway.
+            let snapshot = await withTaskCancellationHandler {
+                await walk.value
+            } onCancel: {
+                walk.cancel()
+            }
 
             guard !Task.isCancelled else { return }
             guard generation == self.snapshotGeneration else { return }
             guard self.vaultURL?.standardizedFileURL == vaultURL.standardizedFileURL else { return }
 
-            self.cachedMarkdownMetadataByPath = snapshot.markdownMetadataByPath
-            self.assetLookupByFilename = snapshot.assetLookupByFilename
-            self.files = snapshot.files
-            self.sidebarNodes = snapshot.nodes
-            self.reconcileSearchIndex()
+            self.applyDirectorySnapshot(snapshot)
 
             if let preferredSelectionURL,
                let matchingURL = self.matchingSidebarURL(for: preferredSelectionURL) {
                 self.selectFile(matchingURL)
+                // Selecting an already-open note schedules no graph rebuild,
+                // and vault opens no longer walk the directory synchronously,
+                // so the graph is refreshed here for the full inventory.
+                self.refreshNoteGraph()
                 self.isLoadingSnapshot = false
                 return
             }
@@ -1702,60 +2404,242 @@ final class Workspace {
         }
     }
 
-    private nonisolated static func snapshotDirectory(
+    /// The background refresh's walk: it stops early once its task is
+    /// cancelled. The partial snapshot it then returns is never applied,
+    /// because only a superseded refresh cancels the walk.
+    private nonisolated static func snapshotDirectoryObservingCancellation(
         at directoryURL: URL,
         sortOrder: SortOrder,
         cachedMarkdownMetadataByPath: [String: CachedMarkdownMetadata]
     ) -> DirectorySnapshot {
-        guard let contents = try? FileManager.default.contentsOfDirectory(
+        withUnsafeCurrentTask { task in
+            snapshotDirectory(
+                at: directoryURL,
+                sortOrder: sortOrder,
+                cachedMarkdownMetadataByPath: cachedMarkdownMetadataByPath,
+                cancellation: TaskCancellationProbe(task: task)
+            )
+        }
+    }
+
+    /// Three phases: walk the tree reading only prefetched metadata, read
+    /// every uncached note body concurrently, then assemble and sort nodes
+    /// and files exactly as a single recursive pass would. Without a
+    /// `cancellation` probe (the synchronous refresh) the walk always runs
+    /// to completion.
+    private nonisolated static func snapshotDirectory(
+        at directoryURL: URL,
+        sortOrder: SortOrder,
+        cachedMarkdownMetadataByPath: [String: CachedMarkdownMetadata],
+        cancellation: TaskCancellationProbe? = nil
+    ) -> DirectorySnapshot {
+        let tree = collectDirectoryTree(
             at: directoryURL,
-            includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .contentModificationDateKey],
-            options: .skipsHiddenFiles
-        ) else {
-            return DirectorySnapshot(nodes: [], files: [], markdownMetadataByPath: [:], assetLookupByFilename: [:])
+            canonicalDirectoryPath: FileItem.canonicalPath(for: directoryURL),
+            cancellation: cancellation
+        )
+        let loadedNotes = loadUncachedNotes(
+            in: tree,
+            cachedMarkdownMetadataByPath: cachedMarkdownMetadataByPath,
+            cancellation: cancellation
+        )
+        return assembleSnapshot(
+            from: tree,
+            sortOrder: sortOrder,
+            cachedMarkdownMetadataByPath: cachedMarkdownMetadataByPath,
+            loadedNotes: loadedNotes
+        )
+    }
+
+    private nonisolated static func collectDirectoryTree(
+        at directoryURL: URL,
+        canonicalDirectoryPath: String,
+        cancellation: TaskCancellationProbe?
+    ) -> DirectoryTree {
+        guard cancellation?.isCancelled != true,
+              let contents = try? FileManager.default.contentsOfDirectory(
+                  at: directoryURL,
+                  includingPropertiesForKeys: Array(directorySnapshotResourceKeys),
+                  options: .skipsHiddenFiles
+              ) else {
+            return DirectoryTree(entries: [], isComplete: false)
         }
 
+        var entries: [DirectoryTreeEntry] = []
+        var isComplete = true
+        entries.reserveCapacity(contents.count)
+
+        for url in contents {
+            // Read the prefetched values from the enumerated URL itself; a
+            // standardized copy loses that cache and pays a stat per key.
+            let values = try? url.resourceValues(forKeys: directorySnapshotResourceKeys)
+            let standardizedURL = url.standardizedFileURL
+            let name = standardizedURL.lastPathComponent
+            let modificationDate = values?.contentModificationDate ?? .distantPast
+
+            // A non-symlink entry's canonical path is its parent's canonical
+            // path plus its name, which spares a symlink resolution per file.
+            let canonicalPath: String
+            if values?.isSymbolicLink == false {
+                canonicalPath = canonicalDirectoryPath.hasSuffix("/")
+                    ? canonicalDirectoryPath + name
+                    : canonicalDirectoryPath + "/" + name
+            } else {
+                canonicalPath = FileItem.canonicalPath(for: standardizedURL)
+            }
+
+            let kind: DirectoryTreeEntry.Kind
+            if values?.isDirectory == true {
+                let subtree = collectDirectoryTree(
+                    at: standardizedURL,
+                    canonicalDirectoryPath: canonicalPath,
+                    cancellation: cancellation
+                )
+                isComplete = isComplete && subtree.isComplete
+                kind = .directory(subtree)
+            } else if Self.isMarkdownFile(standardizedURL) {
+                kind = .markdown
+            } else if Self.isImageFile(standardizedURL) {
+                kind = .image
+            } else if values?.isRegularFile == true {
+                kind = .asset
+            } else {
+                continue
+            }
+
+            entries.append(
+                DirectoryTreeEntry(
+                    url: standardizedURL,
+                    name: name,
+                    canonicalPath: canonicalPath,
+                    modificationDate: modificationDate,
+                    isUbiquitous: values?.isUbiquitousItem == true,
+                    kind: kind
+                )
+            )
+        }
+
+        return DirectoryTree(entries: entries, isComplete: isComplete)
+    }
+
+    /// Reads (and folds) every markdown body the metadata cache cannot serve,
+    /// spreading the work over all cores. This runs inside a detached task
+    /// or a deliberate synchronous refresh, so blocking the caller is fine.
+    private nonisolated static func loadUncachedNotes(
+        in tree: DirectoryTree,
+        cachedMarkdownMetadataByPath: [String: CachedMarkdownMetadata],
+        cancellation: TaskCancellationProbe?
+    ) -> [String: LoadedNote] {
+        var uncachedEntries: [DirectoryTreeEntry] = []
+        collectUncachedNotes(in: tree, cachedMarkdownMetadataByPath: cachedMarkdownMetadataByPath, into: &uncachedEntries)
+        guard !uncachedEntries.isEmpty, cancellation?.isCancelled != true else { return [:] }
+
+        let pending = uncachedEntries
+        let buffer = ConcurrentResultBuffer<LoadedNote>(count: pending.count)
+        if pending.count == 1 {
+            buffer.set(loadNote(pending[0]), at: 0)
+        } else {
+            DispatchQueue.concurrentPerform(iterations: pending.count) { index in
+                // A cancelled walk is discarded, so its remaining reads are skipped.
+                guard cancellation?.isCancelled != true else { return }
+                buffer.set(loadNote(pending[index]), at: index)
+            }
+        }
+
+        var loadedNotes: [String: LoadedNote] = [:]
+        loadedNotes.reserveCapacity(pending.count)
+        for (entry, note) in zip(pending, buffer.elements) {
+            guard let note else { continue }
+            loadedNotes[metadataCacheKey(for: entry.url)] = note
+        }
+        return loadedNotes
+    }
+
+    private nonisolated static func collectUncachedNotes(
+        in tree: DirectoryTree,
+        cachedMarkdownMetadataByPath: [String: CachedMarkdownMetadata],
+        into pending: inout [DirectoryTreeEntry]
+    ) {
+        for entry in tree.entries {
+            switch entry.kind {
+            case .directory(let subtree):
+                collectUncachedNotes(in: subtree, cachedMarkdownMetadataByPath: cachedMarkdownMetadataByPath, into: &pending)
+            case .markdown:
+                if !canReuseCachedMetadata(cachedMarkdownMetadataByPath[metadataCacheKey(for: entry.url)], for: entry) {
+                    pending.append(entry)
+                }
+            case .image, .asset:
+                continue
+            }
+        }
+    }
+
+    private nonisolated static func canReuseCachedMetadata(
+        _ cachedMetadata: CachedMarkdownMetadata?,
+        for entry: DirectoryTreeEntry
+    ) -> Bool {
+        cachedMetadata?.modificationDate == entry.modificationDate
+    }
+
+    private nonisolated static func loadNote(_ entry: DirectoryTreeEntry) -> LoadedNote {
+        guard let content = readSnapshotFileContents(entry.url, isUbiquitous: entry.isUbiquitous) else {
+            return .unreadable
+        }
+        // Filename fallback is presentation metadata only. Opening/indexing
+        // a note must never inject an H1 or otherwise rewrite its bytes.
+        return .loaded(
+            noteTitle: Self.extractTitle(from: content)
+                ?? entry.url.deletingPathExtension().lastPathComponent,
+            noteLinks: MarkdownNoteLinkExtractor.references(in: content),
+            noteBodyStorage: SearchableNoteBody(content)
+        )
+    }
+
+    private nonisolated static func assembleSnapshot(
+        from tree: DirectoryTree,
+        sortOrder: SortOrder,
+        cachedMarkdownMetadataByPath: [String: CachedMarkdownMetadata],
+        loadedNotes: [String: LoadedNote]
+    ) -> DirectorySnapshot {
         var nodes: [SidebarNode] = []
         var files: [FileItem] = []
         var markdownMetadataByPath: [String: CachedMarkdownMetadata] = [:]
         var assetLookupByFilename: [String: [URL]] = [:]
 
-        for url in contents {
-            let standardizedURL = url.standardizedFileURL
-            let values = try? standardizedURL.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .contentModificationDateKey])
-            let modificationDate = values?.contentModificationDate ?? .distantPast
-
-            if values?.isDirectory == true {
-                let childSnapshot = snapshotDirectory(
-                    at: standardizedURL,
+        for entry in tree.entries {
+            switch entry.kind {
+            case .directory(let subtree):
+                let childSnapshot = assembleSnapshot(
+                    from: subtree,
                     sortOrder: sortOrder,
-                    cachedMarkdownMetadataByPath: cachedMarkdownMetadataByPath
+                    cachedMarkdownMetadataByPath: cachedMarkdownMetadataByPath,
+                    loadedNotes: loadedNotes
                 )
-                let childLatestDate = childSnapshot.nodes.map(\.modificationDate).max() ?? modificationDate
+                let childLatestDate = childSnapshot.nodes.map(\.modificationDate).max() ?? entry.modificationDate
                 nodes.append(
                     SidebarNode(
-                        id: standardizedURL,
-                        url: standardizedURL,
-                        name: standardizedURL.lastPathComponent,
+                        id: entry.url,
+                        url: entry.url,
+                        name: entry.name,
                         kind: .folder,
-                        modificationDate: max(modificationDate, childLatestDate),
+                        modificationDate: max(entry.modificationDate, childLatestDate),
                         children: childSnapshot.nodes
                     )
                 )
                 files.append(contentsOf: childSnapshot.files)
                 markdownMetadataByPath.merge(childSnapshot.markdownMetadataByPath) { _, newest in newest }
                 mergeAssetLookup(&assetLookupByFilename, with: childSnapshot.assetLookupByFilename)
-            } else if Self.isMarkdownFile(standardizedURL) {
-                let metadataKey = metadataCacheKey(for: standardizedURL)
+            case .markdown:
+                let metadataKey = metadataCacheKey(for: entry.url)
                 let file = makeFileItem(
-                    at: standardizedURL,
-                    modificationDate: modificationDate,
-                    cachedMetadata: cachedMarkdownMetadataByPath[metadataKey]
+                    for: entry,
+                    cachedMetadata: cachedMarkdownMetadataByPath[metadataKey],
+                    loadedNote: loadedNotes[metadataKey]
                 )
                 nodes.append(
                     SidebarNode(
-                        id: standardizedURL,
-                        url: standardizedURL,
+                        id: entry.url,
+                        url: entry.url,
                         name: file.file.displayName,
                         kind: .file,
                         modificationDate: file.file.modificationDate
@@ -1768,20 +2652,20 @@ final class Workspace {
                     noteLinks: file.noteLinks,
                     noteBodyStorage: file.noteBodyStorage
                 )
-                addAssetLookupEntry(for: standardizedURL, to: &assetLookupByFilename)
-            } else if Self.isImageFile(standardizedURL) {
+                addAssetLookupEntry(for: entry.url, to: &assetLookupByFilename)
+            case .image:
                 nodes.append(
                     SidebarNode(
-                        id: standardizedURL,
-                        url: standardizedURL,
-                        name: standardizedURL.lastPathComponent,
+                        id: entry.url,
+                        url: entry.url,
+                        name: entry.name,
                         kind: .file,
-                        modificationDate: modificationDate
+                        modificationDate: entry.modificationDate
                     )
                 )
-                addAssetLookupEntry(for: standardizedURL, to: &assetLookupByFilename)
-            } else if values?.isRegularFile == true {
-                addAssetLookupEntry(for: standardizedURL, to: &assetLookupByFilename)
+                addAssetLookupEntry(for: entry.url, to: &assetLookupByFilename)
+            case .asset:
+                addAssetLookupEntry(for: entry.url, to: &assetLookupByFilename)
             }
         }
 
@@ -1789,29 +2673,28 @@ final class Workspace {
             nodes: sortSidebarNodes(nodes, sortOrder: sortOrder),
             files: sortFileItems(files, sortOrder: sortOrder),
             markdownMetadataByPath: markdownMetadataByPath,
-            assetLookupByFilename: sortAssetLookup(assetLookupByFilename)
+            assetLookupByFilename: sortAssetLookup(assetLookupByFilename),
+            sortOrder: sortOrder,
+            isComplete: tree.isComplete
         )
     }
 
     private nonisolated static func makeFileItem(
-        at url: URL,
-        modificationDate: Date,
-        cachedMetadata: CachedMarkdownMetadata?
+        for entry: DirectoryTreeEntry,
+        cachedMetadata: CachedMarkdownMetadata?,
+        loadedNote: LoadedNote?
     ) -> (file: FileItem, noteLinks: [NoteLinkReference], noteBodyStorage: SearchableNoteBody) {
         let noteTitle: String?
         let noteLinks: [NoteLinkReference]
         let noteBodyStorage: SearchableNoteBody
-        if let cachedMetadata, cachedMetadata.modificationDate == modificationDate {
+        if let cachedMetadata, canReuseCachedMetadata(cachedMetadata, for: entry) {
             noteTitle = cachedMetadata.noteTitle
             noteLinks = cachedMetadata.noteLinks
             noteBodyStorage = cachedMetadata.noteBodyStorage
-        } else if let content = readFileContents(url) {
-            // Filename fallback is presentation metadata only. Opening/indexing
-            // a note must never inject an H1 or otherwise rewrite its bytes.
-            noteTitle = Self.extractTitle(from: content)
-                ?? url.deletingPathExtension().lastPathComponent
-            noteLinks = MarkdownNoteLinkExtractor.references(in: content)
-            noteBodyStorage = SearchableNoteBody(content)
+        } else if case .loaded(let loadedTitle, let loadedLinks, let loadedStorage)? = loadedNote {
+            noteTitle = loadedTitle
+            noteLinks = loadedLinks
+            noteBodyStorage = loadedStorage
         } else {
             noteTitle = nil
             noteLinks = []
@@ -1819,11 +2702,12 @@ final class Workspace {
         }
 
         let file = FileItem(
-            id: url,
-            name: url.lastPathComponent,
-            url: url,
-            modificationDate: modificationDate,
-            noteTitle: noteTitle
+            id: entry.url,
+            name: entry.name,
+            url: entry.url,
+            modificationDate: entry.modificationDate,
+            noteTitle: noteTitle,
+            canonicalPath: entry.canonicalPath
         )
 
         return (file, noteLinks, noteBodyStorage)
@@ -1869,6 +2753,21 @@ final class Workspace {
         files = Self.sortFileItems(files, sortOrder: sortOrder)
     }
 
+    /// Sorts every level of an already loaded tree, for sort changes that
+    /// must not re-read the directory.
+    private nonisolated static func sortSidebarNodesRecursively(
+        _ nodes: [SidebarNode],
+        sortOrder: SortOrder
+    ) -> [SidebarNode] {
+        let sortedChildren = nodes.map { node -> SidebarNode in
+            guard node.isFolder, !node.children.isEmpty else { return node }
+            var sorted = node
+            sorted.children = sortSidebarNodesRecursively(node.children, sortOrder: sortOrder)
+            return sorted
+        }
+        return sortSidebarNodes(sortedChildren, sortOrder: sortOrder)
+    }
+
     private nonisolated static func sortSidebarNodes(_ nodes: [SidebarNode], sortOrder: SortOrder) -> [SidebarNode] {
         nodes.sorted { lhs, rhs in
             if lhs.isFolder != rhs.isFolder {
@@ -1891,6 +2790,31 @@ final class Workspace {
         try? readFileContentsThrowing(url)
     }
 
+    /// Snapshot reads of local notes skip `NSFileCoordinator`, which costs far
+    /// more than the read itself. Ubiquitous (iCloud) items keep coordinated
+    /// reads so a partially downloaded version is never indexed. The editor
+    /// open path always stays coordinated (`readFileContentsThrowing`).
+    private nonisolated static func readSnapshotFileContents(_ url: URL, isUbiquitous: Bool) -> String? {
+        guard !isUbiquitous else { return readFileContents(url) }
+        return try? readUncoordinatedFileContentsThrowing(url)
+    }
+
+    private nonisolated static func readUncoordinatedFileContentsThrowing(_ url: URL) throws -> String {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            let accessed = url.startAccessingSecurityScopedResource()
+            defer {
+                if accessed {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+            data = try Data(contentsOf: url)
+        }
+        return try decodeTextData(data)
+    }
+
     /// Coordinated reads are important for iCloud/ubiquitous documents: a read
     /// either returns a complete version or throws. A thrown read never becomes
     /// an empty editor buffer that autosave could later write over the note.
@@ -1907,23 +2831,7 @@ final class Workspace {
             }
             data = try coordinatedRead(from: url)
         }
-
-        if let string = String(data: data, encoding: .utf8) {
-            return string
-        }
-
-        // Only try UTF-16 when a byte-order mark proves the encoding. Blindly
-        // decoding arbitrary even-length data as UTF-16 can silently produce
-        // garbage. ISO Latin-1 is the lossless final fallback for every byte.
-        let bytes = [UInt8](data.prefix(2))
-        if bytes == [0xFF, 0xFE] || bytes == [0xFE, 0xFF],
-           let string = String(data: data, encoding: .utf16) {
-            return string
-        }
-        if let string = String(data: data, encoding: .isoLatin1) {
-            return string
-        }
-        throw CocoaError(.fileReadInapplicableStringEncoding)
+        return try decodeTextData(data)
     }
 
     private nonisolated static func coordinatedRead(from url: URL) throws -> Data {
@@ -1988,6 +2896,9 @@ final class Workspace {
         return try accessorResult.get()
     }
 
+    /// UTF-8 first; UTF-16 only when a byte-order mark proves the encoding,
+    /// because blindly decoding even-length data as UTF-16 silently produces
+    /// garbage. ISO Latin-1 is the lossless final fallback for every byte.
     private nonisolated static func decodeTextData(_ data: Data) throws -> String {
         if let string = String(data: data, encoding: .utf8) {
             return string
@@ -2012,19 +2923,16 @@ final class Workspace {
     }
 
     private func matchingSidebarURL(for url: URL) -> URL? {
-        matchingSidebarURL(for: url, in: sidebarNodes)
+        matchingSidebarURL(forCanonicalPath: canonicalPath(for: url), in: sidebarNodes)
     }
 
     private func sidebarNode(for url: URL) -> SidebarNode? {
-        sidebarNode(for: url, in: sidebarNodes)
-    }
-
-    private static func urlsMatch(_ lhs: URL, _ rhs: URL) -> Bool {
-        lhs.resolvingSymlinksInPath().standardizedFileURL == rhs.resolvingSymlinksInPath().standardizedFileURL
+        sidebarNode(forCanonicalPath: canonicalPath(for: url), in: sidebarNodes)
     }
 
     private func ensureOpenedFileIsVisible(at url: URL, markdownContent: String?) {
         let standardizedURL = url.standardizedFileURL
+        let canonical = canonicalPath(for: standardizedURL)
         let modificationDate = (try? standardizedURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? Date()
 
         if Self.isMarkdownFile(standardizedURL) {
@@ -2042,10 +2950,11 @@ final class Workspace {
                 name: standardizedURL.lastPathComponent,
                 url: standardizedURL,
                 modificationDate: modificationDate,
-                noteTitle: noteTitle
+                noteTitle: noteTitle,
+                canonicalPath: canonical
             )
 
-            if let index = files.firstIndex(where: { Self.urlsMatch($0.url, standardizedURL) }) {
+            if let index = fileIndexByCanonicalPath[canonical], files.indices.contains(index) {
                 files[index] = fileItem
             } else {
                 files.append(fileItem)
@@ -2055,7 +2964,7 @@ final class Workspace {
         }
         updateAssetLookup(for: standardizedURL)
 
-        guard !sidebarContainsNode(for: standardizedURL, in: sidebarNodes) else { return }
+        guard !sidebarContainsNode(forCanonicalPath: canonical, in: sidebarNodes) else { return }
 
         sidebarNodes = Self.sortSidebarNodes(
             sidebarNodes + [
@@ -2082,19 +2991,22 @@ final class Workspace {
         }
     }
 
-    private func sidebarContainsNode(for url: URL, in nodes: [SidebarNode]) -> Bool {
+    // The sidebar recursions canonicalize the query once and compare each
+    // node through the memo, which `files` keeps warm for every note URL.
+
+    private func sidebarContainsNode(forCanonicalPath path: String, in nodes: [SidebarNode]) -> Bool {
         nodes.contains { node in
-            Self.urlsMatch(node.url, url) || sidebarContainsNode(for: url, in: node.children)
+            canonicalPath(for: node.url) == path || sidebarContainsNode(forCanonicalPath: path, in: node.children)
         }
     }
 
-    private func matchingSidebarURL(for url: URL, in nodes: [SidebarNode]) -> URL? {
+    private func matchingSidebarURL(forCanonicalPath path: String, in nodes: [SidebarNode]) -> URL? {
         for node in nodes {
-            if Self.urlsMatch(node.url, url) {
+            if canonicalPath(for: node.url) == path {
                 return node.url
             }
 
-            if let childMatch = matchingSidebarURL(for: url, in: node.children) {
+            if let childMatch = matchingSidebarURL(forCanonicalPath: path, in: node.children) {
                 return childMatch
             }
         }
@@ -2102,13 +3014,13 @@ final class Workspace {
         return nil
     }
 
-    private func sidebarNode(for url: URL, in nodes: [SidebarNode]) -> SidebarNode? {
+    private func sidebarNode(forCanonicalPath path: String, in nodes: [SidebarNode]) -> SidebarNode? {
         for node in nodes {
-            if Self.urlsMatch(node.url, url) {
+            if canonicalPath(for: node.url) == path {
                 return node
             }
 
-            if let childMatch = sidebarNode(for: url, in: node.children) {
+            if let childMatch = sidebarNode(forCanonicalPath: path, in: node.children) {
                 return childMatch
             }
         }
@@ -2203,75 +3115,18 @@ final class Workspace {
             includingResourceValuesForKeys: nil,
             relativeTo: nil
         ) {
-            UserDefaults.standard.set(bookmark, forKey: Self.bookmarkKey)
+            userDefaults.set(bookmark, forKey: Self.bookmarkKey)
         }
     }
 
     private func persistSelectedFileURL(_ url: URL) {
         guard let storageKey = selectedFileStorageKey else { return }
-        UserDefaults.standard.set(url.standardizedFileURL.path, forKey: storageKey)
-    }
-
-    private func moveStoredEditorSelections(
-        from oldRootURL: URL,
-        to newRootURL: URL,
-        sourceIsDirectory: Bool
-    ) {
-        let defaults = UserDefaults.standard
-        var storedURLs: Set<URL> = []
-
-        for key in defaults.dictionaryRepresentation().keys where key.hasPrefix(Self.editorSelectionKeyPrefix) {
-            let path = String(key.dropFirst(Self.editorSelectionKeyPrefix.count))
-            storedURLs.insert(URL(fileURLWithPath: path).standardizedFileURL)
-        }
-        for key in pendingEditorSelectionsByKey.keys where key.hasPrefix(Self.editorSelectionKeyPrefix) {
-            let path = String(key.dropFirst(Self.editorSelectionKeyPrefix.count))
-            storedURLs.insert(URL(fileURLWithPath: path).standardizedFileURL)
-        }
-
-        // Include the exact root even if no cursor state currently exists; the
-        // helper is a no-op in that case and this keeps file moves simple.
-        storedURLs.insert(oldRootURL.standardizedFileURL)
-
-        for oldURL in storedURLs {
-            guard let newURL = remappedURL(
-                oldURL,
-                from: oldRootURL,
-                to: newRootURL,
-                sourceIsDirectory: sourceIsDirectory
-            ) else { continue }
-            moveStoredEditorSelectionExactly(from: oldURL, to: newURL)
-        }
-    }
-
-    private func moveStoredEditorSelectionExactly(from oldURL: URL, to newURL: URL) {
-        let defaults = UserDefaults.standard
-        let oldKey = editorSelectionStorageKey(for: oldURL)
-        let newKey = editorSelectionStorageKey(for: newURL)
-        let pendingSelection = pendingEditorSelectionsByKey.removeValue(forKey: oldKey)
-
-        editorSelectionPersistTasksByKey[oldKey]?.cancel()
-        editorSelectionPersistTasksByKey.removeValue(forKey: oldKey)
-        editorSelectionPersistTasksByKey[newKey]?.cancel()
-        editorSelectionPersistTasksByKey.removeValue(forKey: newKey)
-
-        if let pendingSelection {
-            pendingEditorSelectionsByKey[newKey] = pendingSelection
-            defaults.set(pendingSelection, forKey: newKey)
-            pendingEditorSelectionsByKey.removeValue(forKey: newKey)
-            defaults.removeObject(forKey: oldKey)
-            return
-        }
-
-        guard let persistedSelection = defaults.array(forKey: oldKey) else { return }
-
-        defaults.set(persistedSelection, forKey: newKey)
-        defaults.removeObject(forKey: oldKey)
+        userDefaults.set(url.standardizedFileURL.path, forKey: storageKey)
     }
 
     private func restoreSelectedFileURL() -> URL? {
         guard let storageKey = selectedFileStorageKey,
-              let path = UserDefaults.standard.string(forKey: storageKey) else {
+              let path = userDefaults.string(forKey: storageKey) else {
             return nil
         }
 
@@ -2280,51 +3135,14 @@ final class Workspace {
 
     private func clearStoredSelectedFileURL() {
         guard let storageKey = selectedFileStorageKey else { return }
-        UserDefaults.standard.removeObject(forKey: storageKey)
-    }
-
-    private func editorSelectionKeys(forDeletedItemAt url: URL, isDirectory: Bool) -> [String] {
-        guard isDirectory else {
-            return [editorSelectionStorageKey(for: url)]
-        }
-
-        let defaults = UserDefaults.standard
-        let prefix = Self.editorSelectionKeyPrefix
-        var keysToRemove: Set<String> = []
-
-        for key in defaults.dictionaryRepresentation().keys where key.hasPrefix(prefix) {
-            let path = String(key.dropFirst(prefix.count))
-            let storedURL = URL(fileURLWithPath: path)
-            if deletedItem(url, isDirectory: true, contains: storedURL) {
-                keysToRemove.insert(key)
-            }
-        }
-
-        for key in pendingEditorSelectionsByKey.keys where key.hasPrefix(prefix) {
-            let path = String(key.dropFirst(prefix.count))
-            let storedURL = URL(fileURLWithPath: path)
-            if deletedItem(url, isDirectory: true, contains: storedURL) {
-                keysToRemove.insert(key)
-            }
-        }
-
-        return Array(keysToRemove)
-    }
-
-    private func clearStoredEditorSelections(forKeys keys: [String]) {
-        let defaults = UserDefaults.standard
-        for key in keys {
-            editorSelectionPersistTasksByKey[key]?.cancel()
-            editorSelectionPersistTasksByKey.removeValue(forKey: key)
-            pendingEditorSelectionsByKey.removeValue(forKey: key)
-            defaults.removeObject(forKey: key)
-        }
+        userDefaults.removeObject(forKey: storageKey)
     }
 
     private func deletedItem(_ deletedURL: URL, isDirectory: Bool, contains candidateURL: URL) -> Bool {
-        let standardizedCandidateURL = candidateURL.resolvingSymlinksInPath().standardizedFileURL
+        let candidatePath = canonicalPath(for: candidateURL)
+        let deletedPath = canonicalPath(for: deletedURL)
 
-        if Self.urlsMatch(standardizedCandidateURL, deletedURL) {
+        if candidatePath == deletedPath {
             return true
         }
 
@@ -2332,17 +3150,24 @@ final class Workspace {
             return false
         }
 
-        return isDescendant(standardizedCandidateURL, of: deletedURL, allowEqual: false)
+        let deletedPrefix = deletedPath.hasSuffix("/") ? deletedPath : deletedPath + "/"
+        return candidatePath.hasPrefix(deletedPrefix)
     }
 
     private func persistSortOrder() {
         guard let storageKey = sortOrderStorageKey else { return }
-        UserDefaults.standard.set(sortOrder.rawValue, forKey: storageKey)
+        userDefaults.set(sortOrder.rawValue, forKey: storageKey)
     }
 
+    /// Restores the vault's persisted order without the user-initiated side
+    /// effects: the value is already persisted, and the caller is about to
+    /// load a fresh snapshot in that order.
     private func restoreSortOrder() {
+        isRestoringSortOrder = true
+        defer { isRestoringSortOrder = false }
+
         guard let storageKey = sortOrderStorageKey,
-              let rawValue = UserDefaults.standard.string(forKey: storageKey),
+              let rawValue = userDefaults.string(forKey: storageKey),
               let restored = SortOrder(rawValue: rawValue) else {
             sortOrder = preferences.defaultSortOrder
             return
@@ -2361,18 +3186,14 @@ final class Workspace {
         return "sortOrder::" + vaultURL.standardizedFileURL.path
     }
 
-    private func editorSelectionStorageKey(for url: URL) -> String {
-        Self.editorSelectionKeyPrefix + url.resolvingSymlinksInPath().standardizedFileURL.path
-    }
-
     private func beginAccessingVault(_ url: URL) {
         let standardizedURL = url.standardizedFileURL
 
         if vaultFilePresenter?.presentedItemURL?.standardizedFileURL != standardizedURL {
             vaultFilePresenter?.stop()
-            let presenter = VaultFilePresenter(vaultURL: standardizedURL) { [weak self] change in
+            let presenter = VaultFilePresenter(vaultURL: standardizedURL) { [weak self] changes in
                 Task { @MainActor [weak self] in
-                    self?.scheduleExternalChangeHandling(change)
+                    self?.scheduleExternalChangeHandling(changes)
                 }
             }
             vaultFilePresenter = presenter
@@ -2394,16 +3215,33 @@ final class Workspace {
         }
     }
 
-    private func scheduleExternalChangeHandling(_ change: VaultFileChange) {
-        pendingExternalChanges.append(change)
+    /// Queues file-presenter changes for one debounced handling pass. `.changed`
+    /// events coalesce per path and moves keep their order. Once more than
+    /// `VaultFileChangeBatch.leadingFlushThreshold` changes are pending they
+    /// are handled at once, so a long iCloud or git burst is processed in
+    /// bounded batches instead of as one giant batch after the burst ends.
+    func scheduleExternalChangeHandling(_ changes: [VaultFileChange]) {
+        guard !changes.isEmpty else { return }
+        pendingExternalChanges.append(contentsOf: changes)
+        guard pendingExternalChanges.count <= VaultFileChangeBatch.leadingFlushThreshold else {
+            handlePendingExternalChanges()
+            return
+        }
+
         externalChangeTask?.cancel()
         externalChangeTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(180))
             guard let self, !Task.isCancelled else { return }
-            let changes = self.pendingExternalChanges
-            self.pendingExternalChanges.removeAll(keepingCapacity: true)
-            self.handleExternalChanges(changes)
+            self.handlePendingExternalChanges()
         }
+    }
+
+    private func handlePendingExternalChanges() {
+        externalChangeTask?.cancel()
+        externalChangeTask = nil
+        let changes = pendingExternalChanges.takeAll()
+        guard !changes.isEmpty else { return }
+        handleExternalChanges(changes)
     }
 
     /// Applies the entire debounced change batch. Keeping move pairs intact and
@@ -2412,6 +3250,7 @@ final class Workspace {
     func handleExternalChanges(_ changes: [VaultFileChange]) {
         invalidateCachedMetadata(for: changes)
         remapSelectionForExternalMoves(in: changes)
+        remapStoredEditorSelections(forExternalMovesIn: changes)
 
         if let selectedFileURL,
            selectedFileIsMarkdown,
@@ -2453,7 +3292,7 @@ final class Workspace {
     private func invalidateCachedMetadata(for changes: [VaultFileChange]) {
         guard let vaultURL else { return }
         let vaultPath = vaultURL.standardizedFileURL.path
-        var affectedPaths: [String] = []
+        var affectedPaths: Set<Substring> = []
 
         for change in changes {
             for url in change.affectedURLs {
@@ -2462,15 +3301,30 @@ final class Workspace {
                     cachedMarkdownMetadataByPath.removeAll(keepingCapacity: true)
                     return
                 }
-                affectedPaths.append(path)
+                affectedPaths.insert(Substring(path))
             }
         }
 
         guard !affectedPaths.isEmpty else { return }
+        // Looking each cached path and its ancestors up in a set keeps a
+        // large batch linear in the cache size rather than cache x batch.
         cachedMarkdownMetadataByPath = cachedMarkdownMetadataByPath.filter { key, _ in
-            !affectedPaths.contains { path in
-                key == path || key.hasPrefix(path + "/")
+            !Self.isPath(key, equalToOrInsideAnyOf: affectedPaths)
+        }
+    }
+
+    /// Whether `path`, or a directory containing it, is one of `roots`.
+    private nonisolated static func isPath(_ path: String, equalToOrInsideAnyOf roots: Set<Substring>) -> Bool {
+        var candidate = Substring(path)
+        while true {
+            if roots.contains(candidate) {
+                return true
             }
+            guard let separator = candidate.lastIndex(of: "/"),
+                  separator > candidate.startIndex else {
+                return false
+            }
+            candidate = candidate[..<separator]
         }
     }
 
@@ -2500,12 +3354,23 @@ final class Workspace {
             self.selectedFileURL = remappedURL
             persistSelectedFileURL(remappedURL)
             recoveryStore.moveDraft(from: selectedFileURL, to: remappedURL)
-            moveStoredEditorSelections(
-                from: oldURL,
-                to: newURL,
-                sourceIsDirectory: selectedPath != oldPath
-            )
+            // The move superseded any draft write still pending for the old
+            // path, so a dirty buffer is drafted again under its new path.
+            if hasUnsavedChanges {
+                scheduleRecoveryDraft()
+            }
             return
+        }
+    }
+
+    /// Re-keys stored editor selections for every external move, in order,
+    /// so chained moves within one batch land on the final path.
+    private func remapStoredEditorSelections(forExternalMovesIn changes: [VaultFileChange]) {
+        loadEditorSelectionsIfNeeded()
+        guard !editorSelectionsByPath.isEmpty else { return }
+        for change in changes {
+            guard case .moved(let oldURL, let newURL) = change else { continue }
+            moveStoredEditorSelections(fromRootPaths: editorSelectionRootPaths(for: oldURL), to: newURL)
         }
     }
 
@@ -2516,4 +3381,100 @@ private struct DirectorySnapshot: Sendable {
     let files: [FileItem]
     let markdownMetadataByPath: [String: CachedMarkdownMetadata]
     let assetLookupByFilename: [String: [URL]]
+    /// The order `nodes` and `files` are sorted in.
+    let sortOrder: SortOrder
+    /// `false` when some directory could not be listed, so the inventory may
+    /// be missing notes that still exist.
+    let isComplete: Bool
+}
+
+/// Prefetched for every enumerated URL so the snapshot walk never stats
+/// twice. `isUbiquitousItem` decides between coordinated and plain reads;
+/// `isSymbolicLink` decides whether a canonical path needs resolving.
+private let directorySnapshotResourceKeys: Set<URLResourceKey> = [
+    .isDirectoryKey,
+    .isRegularFileKey,
+    .isSymbolicLinkKey,
+    .isUbiquitousItemKey,
+    .contentModificationDateKey
+]
+
+/// The metadata-only result of walking one directory; entries keep the
+/// enumeration order so assembly sorts exactly as the single pass did.
+private struct DirectoryTree: Sendable {
+    let entries: [DirectoryTreeEntry]
+    /// `false` when this directory, or any below it, could not be listed.
+    var isComplete = true
+}
+
+private struct DirectoryTreeEntry: Sendable {
+    enum Kind: Sendable {
+        case directory(DirectoryTree)
+        case markdown
+        case image
+        case asset
+    }
+
+    let url: URL
+    let name: String
+    let canonicalPath: String
+    let modificationDate: Date
+    let isUbiquitous: Bool
+    let kind: Kind
+}
+
+private enum LoadedNote: Sendable {
+    case loaded(noteTitle: String?, noteLinks: [NoteLinkReference], noteBodyStorage: SearchableNoteBody)
+    case unreadable
+}
+
+private struct SearchTitleMatch: Sendable {
+    let rank: Int
+    let sourceIndex: Int
+    let result: NoteSearchResult
+}
+
+private struct SearchChunkMatches: Sendable {
+    var titleMatches: [SearchTitleMatch] = []
+    var bodyMatches: [NoteSearchResult] = []
+}
+
+/// Index-addressed results for `DispatchQueue.concurrentPerform` workers.
+/// Each slot is written by exactly one iteration; the lock only orders the
+/// writes against the final read.
+private final class ConcurrentResultBuffer<Element: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [Element?]
+
+    init(count: Int) {
+        storage = Array(repeating: nil, count: count)
+    }
+
+    func set(_ element: Element, at index: Int) {
+        lock.lock()
+        storage[index] = element
+        lock.unlock()
+    }
+
+    var elements: [Element?] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+}
+
+/// Lets `concurrentPerform` workers, which run outside the calling task,
+/// observe that task's cancellation. `UnsafeCurrentTask.isCancelled` is an
+/// atomic status read, and the probe is only used within the dynamic extent
+/// of the `withUnsafeCurrentTask` call that created it.
+private final class TaskCancellationProbe: @unchecked Sendable {
+    private let task: UnsafeCurrentTask?
+
+    init(task: UnsafeCurrentTask?) {
+        self.task = task
+    }
+
+    var isCancelled: Bool {
+        task?.isCancelled ?? false
+    }
 }

@@ -13,12 +13,14 @@ final class WorkspaceRenameTests: XCTestCase {
             ]
         )
 
-        let initialWorkspace = Workspace()
+        // Both workspaces share one defaults suite, as consecutive launches do.
+        let defaults = try makeUserDefaultsSuite().defaults
+        let initialWorkspace = try makeWorkspace(userDefaults: defaults)
         initialWorkspace.openVault(fixture.vaultURL)
         initialWorkspace.selectFile(fixture.fileURLs[0])
         XCTAssertEqual(initialWorkspace.selectedFileURL?.standardizedFileURL, fixture.fileURLs[0].standardizedFileURL)
 
-        let restoredWorkspace = Workspace()
+        let restoredWorkspace = try makeWorkspace(userDefaults: defaults)
         for _ in 0..<20 {
             if restoredWorkspace.selectedFileURL?.standardizedFileURL == fixture.fileURLs[0].standardizedFileURL {
                 break
@@ -35,7 +37,7 @@ final class WorkspaceRenameTests: XCTestCase {
 
     func testRenameItemUpdatesSelectionAndHeadingWhenTitleMatchesFilename() throws {
         let fixture = try makeWorkspaceFixture(fileName: "Old", content: "# Old\n\nBody")
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
         workspace.selectFile(fixture.fileURL)
@@ -54,7 +56,7 @@ final class WorkspaceRenameTests: XCTestCase {
 
     func testRenameItemPreservesCustomHeading() throws {
         let fixture = try makeWorkspaceFixture(fileName: "Old", content: "# Custom Title\n\nBody")
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
 
@@ -70,7 +72,7 @@ final class WorkspaceRenameTests: XCTestCase {
                 ("Index", "See [[Old]] and [Old](Old.md)."),
             ]
         )
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
 
@@ -87,7 +89,7 @@ final class WorkspaceRenameTests: XCTestCase {
         let destinationURL = fixture.vaultURL.appendingPathComponent("Taken.md")
         try Data("# Taken\n".utf8).write(to: destinationURL, options: .atomic)
 
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
 
@@ -103,7 +105,7 @@ final class WorkspaceRenameTests: XCTestCase {
         let nestedFileURL = folderURL.appendingPathComponent("Nested").appendingPathExtension("md")
         try Data("# Nested\n\nBody".utf8).write(to: nestedFileURL, options: .atomic)
 
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
 
@@ -126,7 +128,7 @@ final class WorkspaceRenameTests: XCTestCase {
         let nestedFileURL = folderURL.appendingPathComponent("Nested.md")
         try Data("# Nested\n\nBody".utf8).write(to: nestedFileURL, options: .atomic)
 
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
         workspace.selectFile(nestedFileURL)
@@ -150,7 +152,7 @@ final class WorkspaceRenameTests: XCTestCase {
         let nestedFileURL = folderURL.appendingPathComponent("Nested.md")
         try Data("# Nested\n\nBody".utf8).write(to: nestedFileURL, options: .atomic)
 
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
         workspace.selectFile(nestedFileURL)
@@ -169,7 +171,7 @@ final class WorkspaceRenameTests: XCTestCase {
 
     func testRefreshFilesDoesNotRewriteFilesWithoutHeadings() throws {
         let fixture = try makeWorkspaceFixture(fileName: "Untitled", content: "Plain body")
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
 
         workspace.refreshFiles()
@@ -185,7 +187,7 @@ final class WorkspaceRenameTests: XCTestCase {
                 ("Second", "# Second\n\nBody")
             ]
         )
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
 
         workspace.persistEditorSelection(NSRange(location: 5, length: 0), for: fixture.fileURLs[0])
         workspace.persistEditorSelection(NSRange(location: 12, length: 3), for: fixture.fileURLs[1])
@@ -194,12 +196,242 @@ final class WorkspaceRenameTests: XCTestCase {
         XCTAssertEqual(workspace.editorSelection(for: fixture.fileURLs[1]), NSRange(location: 12, length: 3))
     }
 
+    func testEditorSelectionsPersistInOneDictionaryPerVault() async throws {
+        let fixture = try makeWorkspaceFixture(
+            files: [
+                ("First", "# First\n\nBody"),
+                ("Second", "# Second\n\nBody")
+            ]
+        )
+        let suite = try makeUserDefaultsSuite()
+        let workspace = try makeWorkspace(userDefaults: suite.defaults)
+        workspace.vaultURL = fixture.vaultURL
+        workspace.refreshFiles()
+
+        workspace.persistEditorSelection(NSRange(location: 5, length: 0), for: fixture.fileURLs[0])
+        workspace.persistEditorSelection(NSRange(location: 12, length: 3), for: fixture.fileURLs[1])
+
+        // Writes are debounced; wait for the single dictionary to land.
+        let storageKey = editorSelectionsKey(for: fixture.vaultURL)
+        for _ in 0..<500 where suite.defaults.dictionary(forKey: storageKey)?.count != 2 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertEqual(
+            suite.defaults.dictionary(forKey: storageKey) as? [String: [Int]],
+            [
+                FileItem.canonicalPath(for: fixture.fileURLs[0]): [5, 0],
+                FileItem.canonicalPath(for: fixture.fileURLs[1]): [12, 3]
+            ]
+        )
+        let storedKeys = suite.defaults.persistentDomain(forName: suite.name)?.keys.map { $0 } ?? []
+        XCTAssertFalse(storedKeys.contains { $0.hasPrefix("editorSelection::") })
+
+        let restoredWorkspace = try makeWorkspace(userDefaults: suite.defaults)
+        restoredWorkspace.vaultURL = fixture.vaultURL
+        XCTAssertEqual(restoredWorkspace.editorSelection(for: fixture.fileURLs[0]), NSRange(location: 5, length: 0))
+        XCTAssertEqual(restoredWorkspace.editorSelection(for: fixture.fileURLs[1]), NSRange(location: 12, length: 3))
+    }
+
+    func testSnapshotPrunesSelectionsOfNotesThatNoLongerExist() throws {
+        let fixture = try makeWorkspaceFixture(
+            files: [
+                ("Keep", "# Keep\n\nBody"),
+                ("Gone", "# Gone\n\nBody")
+            ]
+        )
+        let suite = try makeUserDefaultsSuite()
+        let workspace = try makeWorkspace(userDefaults: suite.defaults)
+        workspace.vaultURL = fixture.vaultURL
+        workspace.refreshFiles()
+        workspace.persistEditorSelection(NSRange(location: 2, length: 0), for: fixture.fileURLs[0])
+        workspace.persistEditorSelection(NSRange(location: 3, length: 1), for: fixture.fileURLs[1])
+
+        // Removed behind the workspace's back, so only the snapshot sees it.
+        try FileManager.default.removeItem(at: fixture.fileURLs[1])
+        workspace.refreshFiles()
+
+        XCTAssertEqual(workspace.editorSelection(for: fixture.fileURLs[0]), NSRange(location: 2, length: 0))
+        XCTAssertNil(workspace.editorSelection(for: fixture.fileURLs[1]))
+        // Pruning writes the dictionary through immediately.
+        XCTAssertEqual(
+            suite.defaults.dictionary(forKey: editorSelectionsKey(for: fixture.vaultURL)) as? [String: [Int]],
+            [FileItem.canonicalPath(for: fixture.fileURLs[0]): [2, 0]]
+        )
+    }
+
+    func testExternalMoveRemapsStoredSelectionOfAnyNote() throws {
+        let fixture = try makeWorkspaceFixture(
+            files: [
+                ("Open", "# Open\n\nBody"),
+                ("Moved", "# Moved\n\nBody")
+            ]
+        )
+        let workspace = try makeWorkspace()
+        workspace.vaultURL = fixture.vaultURL
+        workspace.refreshFiles()
+        XCTAssertTrue(workspace.selectFile(fixture.fileURLs[0]))
+        workspace.persistEditorSelection(NSRange(location: 4, length: 1), for: fixture.fileURLs[1])
+
+        let destinationURL = fixture.vaultURL.appendingPathComponent("Renamed.md")
+        try FileManager.default.moveItem(at: fixture.fileURLs[1], to: destinationURL)
+        workspace.handleExternalChanges([.moved(from: fixture.fileURLs[1], to: destinationURL)])
+
+        XCTAssertEqual(workspace.editorSelection(for: destinationURL), NSRange(location: 4, length: 1))
+        XCTAssertNil(workspace.editorSelection(for: fixture.fileURLs[1]))
+    }
+
+    func testLegacyPerNoteSelectionKeysAreImportedOnceAndRemoved() throws {
+        let fixture = try makeWorkspaceFixture(fileName: "Note", content: "# Note\n\nBody")
+        let suite = try makeUserDefaultsSuite()
+        let notePath = FileItem.canonicalPath(for: fixture.fileURL)
+        suite.defaults.set([6, 2], forKey: "editorSelection::" + notePath)
+        suite.defaults.set([1, 0], forKey: "editorSelection::/elsewhere/Other.md")
+
+        let workspace = try makeWorkspace(userDefaults: suite.defaults)
+        workspace.vaultURL = fixture.vaultURL
+        workspace.refreshFiles()
+
+        XCTAssertEqual(workspace.editorSelection(for: fixture.fileURL), NSRange(location: 6, length: 2))
+        // Only the loaded vault's legacy keys are consumed; another vault's
+        // keys stay until that vault is opened.
+        let storedKeys = suite.defaults.persistentDomain(forName: suite.name)?.keys.map { $0 } ?? []
+        XCTAssertEqual(
+            storedKeys.filter { $0.hasPrefix("editorSelection::") },
+            ["editorSelection::/elsewhere/Other.md"]
+        )
+        XCTAssertEqual(
+            suite.defaults.dictionary(forKey: editorSelectionsKey(for: fixture.vaultURL)) as? [String: [Int]],
+            [notePath: [6, 2]]
+        )
+
+        // The import runs once per vault; later legacy keys are ignored.
+        suite.defaults.set([9, 9], forKey: "editorSelection::" + notePath)
+        let laterWorkspace = try makeWorkspace(userDefaults: suite.defaults)
+        laterWorkspace.vaultURL = fixture.vaultURL
+        XCTAssertEqual(laterWorkspace.editorSelection(for: fixture.fileURL), NSRange(location: 6, length: 2))
+    }
+
+    func testLegacySelectionMigrationOfOneVaultKeepsOtherVaultsKeys() throws {
+        let first = try makeWorkspaceFixture(fileName: "First", content: "# First\n\nBody")
+        let second = try makeWorkspaceFixture(fileName: "Second", content: "# Second\n\nBody")
+        let suite = try makeUserDefaultsSuite()
+        let firstPath = FileItem.canonicalPath(for: first.fileURL)
+        let secondPath = FileItem.canonicalPath(for: second.fileURL)
+        suite.defaults.set([3, 1], forKey: "editorSelection::" + firstPath)
+        suite.defaults.set([8, 0], forKey: "editorSelection::" + secondPath)
+
+        let firstWorkspace = try makeWorkspace(userDefaults: suite.defaults)
+        firstWorkspace.vaultURL = first.vaultURL
+        firstWorkspace.refreshFiles()
+        XCTAssertEqual(firstWorkspace.editorSelection(for: first.fileURL), NSRange(location: 3, length: 1))
+        XCTAssertNil(suite.defaults.object(forKey: "editorSelection::" + firstPath))
+        XCTAssertNotNil(suite.defaults.object(forKey: "editorSelection::" + secondPath))
+
+        // Opening the second vault later still imports its saved positions.
+        let secondWorkspace = try makeWorkspace(userDefaults: suite.defaults)
+        secondWorkspace.vaultURL = second.vaultURL
+        secondWorkspace.refreshFiles()
+        XCTAssertEqual(secondWorkspace.editorSelection(for: second.fileURL), NSRange(location: 8, length: 0))
+        XCTAssertNil(suite.defaults.object(forKey: "editorSelection::" + secondPath))
+        XCTAssertEqual(
+            suite.defaults.dictionary(forKey: editorSelectionsKey(for: second.vaultURL)) as? [String: [Int]],
+            [secondPath: [8, 0]]
+        )
+    }
+
+    func testSnapshotWithUnlistableFolderDoesNotPruneSelections() throws {
+        let fixture = try makeWorkspaceFixture(fileName: "Keep", content: "# Keep\n\nBody")
+        let folderURL = fixture.vaultURL.appendingPathComponent("Locked", isDirectory: true)
+        try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+        let lockedNoteURL = folderURL.appendingPathComponent("Hidden.md")
+        try Data("# Hidden\n\nBody".utf8).write(to: lockedNoteURL, options: .atomic)
+
+        let suite = try makeUserDefaultsSuite()
+        let workspace = try makeWorkspace(userDefaults: suite.defaults)
+        workspace.vaultURL = fixture.vaultURL
+        workspace.refreshFiles()
+        XCTAssertNotNil(workspace.fileItem(for: lockedNoteURL))
+        workspace.persistEditorSelection(NSRange(location: 4, length: 0), for: lockedNoteURL)
+        workspace.persistEditorSelection(NSRange(location: 2, length: 0), for: fixture.fileURL)
+
+        // Registered after the fixture's own teardown, so it runs first and
+        // lets the directory be removed.
+        let vaultURL = fixture.vaultURL
+        addTeardownBlock {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: folderURL.path)
+            try? FileManager.default.removeItem(at: vaultURL)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: folderURL.path)
+        workspace.refreshFiles()
+
+        // The folder could not be listed, so its note is missing from the
+        // inventory, but its saved position must survive.
+        XCTAssertNil(workspace.fileItem(for: lockedNoteURL))
+        XCTAssertEqual(workspace.editorSelection(for: lockedNoteURL), NSRange(location: 4, length: 0))
+        XCTAssertEqual(workspace.editorSelection(for: fixture.fileURL), NSRange(location: 2, length: 0))
+
+        // Once the folder lists again, a complete snapshot prunes normally.
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: folderURL.path)
+        try FileManager.default.removeItem(at: lockedNoteURL)
+        workspace.refreshFiles()
+        XCTAssertNil(workspace.editorSelection(for: lockedNoteURL))
+        XCTAssertEqual(workspace.editorSelection(for: fixture.fileURL), NSRange(location: 2, length: 0))
+    }
+
+    func testSnapshotKeepsSelectionsOfNotesOutsideTheVault() throws {
+        let fixture = try makeWorkspaceFixture(fileName: "Inside", content: "# Inside\n\nBody")
+        let outside = try makeWorkspaceFixture(fileName: "Outside", content: "# Outside\n\nBody")
+        let workspace = try makeWorkspace()
+        workspace.vaultURL = fixture.vaultURL
+        workspace.refreshFiles()
+        workspace.persistEditorSelection(NSRange(location: 5, length: 0), for: outside.fileURL)
+
+        workspace.refreshFiles()
+
+        XCTAssertEqual(workspace.editorSelection(for: outside.fileURL), NSRange(location: 5, length: 0))
+    }
+
+    func testSortChangeDuringBackgroundSnapshotAppliesNewOrder() async throws {
+        let fixture = try makeWorkspaceFixture(
+            files: [
+                ("Alpha", "# Alpha\n\nBody"),
+                ("Bravo", "# Bravo\n\nBody"),
+                ("Charlie", "# Charlie\n\nBody")
+            ]
+        )
+        // Newest first by date is the reverse of name order.
+        for (index, url) in fixture.fileURLs.enumerated() {
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date(timeIntervalSince1970: 1_700_000_000 + Double(index) * 1_000)],
+                ofItemAtPath: url.path
+            )
+        }
+        let suite = try makeUserDefaultsSuite()
+        let workspace = try makeWorkspace(userDefaults: suite.defaults)
+
+        XCTAssertTrue(workspace.openVault(fixture.vaultURL))
+        XCTAssertEqual(workspace.sortOrder, .byDate)
+        XCTAssertTrue(workspace.isLoadingSnapshot)
+        // The walk started in date order; the user switches to name order
+        // before it lands.
+        workspace.sortOrder = .byName
+
+        for _ in 0..<500 where workspace.isLoadingSnapshot {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(workspace.isLoadingSnapshot)
+        XCTAssertEqual(workspace.sortOrder, .byName)
+        XCTAssertEqual(workspace.files.map(\.name), ["Alpha.md", "Bravo.md", "Charlie.md"])
+        XCTAssertEqual(workspace.sidebarNodes.map(\.name), ["Alpha", "Bravo", "Charlie"])
+    }
+
     func testCreateNewFileInFolderSelectsCreatedFile() throws {
         let fixture = try makeWorkspaceFixture(fileName: "Existing", content: "# Existing\n\nBody")
         let folderURL = fixture.vaultURL.appendingPathComponent("Drafts", isDirectory: true)
         try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
 
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
 
@@ -218,7 +450,7 @@ final class WorkspaceRenameTests: XCTestCase {
         try "# Imported".write(to: external, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: external) }
 
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
         workspace.importDroppedFile(external)
@@ -231,7 +463,7 @@ final class WorkspaceRenameTests: XCTestCase {
 
     func testDeleteItemRemovesSelectedMarkdownFileAndClearsSelectionState() throws {
         let fixture = try makeWorkspaceFixture(fileName: "Old", content: "# Old\n\nBody")
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
         workspace.selectFile(fixture.fileURL)
@@ -252,7 +484,7 @@ final class WorkspaceRenameTests: XCTestCase {
         let nestedFileURL = folderURL.appendingPathComponent("Nested.md")
         try Data("# Nested\n\nBody".utf8).write(to: nestedFileURL, options: .atomic)
 
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
         workspace.selectFile(nestedFileURL)
@@ -271,7 +503,7 @@ final class WorkspaceRenameTests: XCTestCase {
         let folderURL = fixture.vaultURL.appendingPathComponent("Archive", isDirectory: true)
         try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
 
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
         workspace.selectFile(fixture.fileURL)
@@ -297,7 +529,7 @@ final class WorkspaceRenameTests: XCTestCase {
         let imageURL = folderURL.appendingPathComponent("photo.png")
         try Data([0x89, 0x50, 0x4E, 0x47]).write(to: imageURL, options: .atomic)
 
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
         workspace.selectFile(imageURL)
@@ -334,6 +566,66 @@ final class WorkspaceRenameTests: XCTestCase {
         XCTAssertEqual(restoredResult, .restored([folderURL]))
     }
 
+    func testSidebarExpansionLiveFilterMatchesStandardizedURLsOnly() throws {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SidebarExpansion-\(UUID().uuidString)", isDirectory: true)
+        let projectsURL = URL(fileURLWithPath: rootURL.path + "/Projects", isDirectory: true)
+        let archiveURL = URL(fileURLWithPath: rootURL.path + "/Archive", isDirectory: true)
+        let validFolderURLs: Set<URL> = [projectsURL, archiveURL]
+
+        // (a) Another spelling of a valid folder is kept, in the valid set's form.
+        let dottedProjectsURL = URL(fileURLWithPath: rootURL.path + "/./Projects", isDirectory: true)
+        XCTAssertNotEqual(dottedProjectsURL, projectsURL)
+        XCTAssertEqual(
+            SidebarExpansionPersistence.filteredExpandedFolderURLs(
+                [dottedProjectsURL],
+                validFolderURLs: validFolderURLs
+            ),
+            [projectsURL]
+        )
+
+        // (b) A folder that is no longer in the sidebar is dropped.
+        let removedURL = URL(fileURLWithPath: rootURL.path + "/Removed", isDirectory: true)
+        XCTAssertEqual(
+            SidebarExpansionPersistence.filteredExpandedFolderURLs(
+                [archiveURL, removedURL],
+                validFolderURLs: validFolderURLs
+            ),
+            [archiveURL]
+        )
+
+        // (c) A symlink that names a valid folder only once resolved is not
+        // matched by the live filter; that resolution is reserved for the
+        // stored-path restore.
+        let realURL = URL(fileURLWithPath: rootURL.path + "/Real", isDirectory: true)
+        let linkURL = URL(fileURLWithPath: rootURL.path + "/Link", isDirectory: true)
+        try FileManager.default.createDirectory(at: realURL, withIntermediateDirectories: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: rootURL)
+        }
+        try FileManager.default.createSymbolicLink(at: linkURL, withDestinationURL: realURL)
+        XCTAssertEqual(
+            linkURL.resolvingSymlinksInPath().standardizedFileURL.path,
+            realURL.resolvingSymlinksInPath().standardizedFileURL.path
+        )
+
+        XCTAssertEqual(
+            SidebarExpansionPersistence.filteredExpandedFolderURLs(
+                [linkURL],
+                validFolderURLs: [realURL]
+            ),
+            []
+        )
+        XCTAssertEqual(
+            SidebarExpansionPersistence.restoreResult(
+                storedPaths: [linkURL.path],
+                validFolderURLs: [realURL],
+                isLoadingSnapshot: false
+            ),
+            .restored([realURL])
+        )
+    }
+
     private func makeWorkspaceFixture(fileName: String, content: String) throws -> (vaultURL: URL, fileURL: URL) {
         let fixture = try makeWorkspaceFixture(files: [(fileName, content)])
         return (fixture.vaultURL, fixture.fileURLs[0])
@@ -355,20 +647,44 @@ final class WorkspaceRenameTests: XCTestCase {
             return fileURL
         }
 
-        let selectedFileKey = "selectedFile::" + vaultURL.standardizedFileURL.path
-
         addTeardownBlock {
-            UserDefaults.standard.removeObject(forKey: "vaultBookmark")
-            UserDefaults.standard.removeObject(forKey: selectedFileKey)
-            let selectionKeys = UserDefaults.standard.dictionaryRepresentation().keys.filter {
-                $0.hasPrefix("editorSelection::" + vaultURL.standardizedFileURL.path)
-            }
-            for key in selectionKeys {
-                UserDefaults.standard.removeObject(forKey: key)
-            }
             try? FileManager.default.removeItem(at: vaultURL)
         }
 
         return (vaultURL, fileURLs)
+    }
+
+    /// A workspace whose persisted state lives in a throwaway defaults suite
+    /// and recovery directory, never in the app's real ones.
+    private func makeWorkspace(userDefaults: UserDefaults? = nil) throws -> Workspace {
+        let defaults: UserDefaults
+        if let userDefaults {
+            defaults = userDefaults
+        } else {
+            defaults = try makeUserDefaultsSuite().defaults
+        }
+        let recoveryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WorkspaceRenameTests-Recovery-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: recoveryURL)
+        }
+        return Workspace(
+            preferences: AppPreferences(userDefaults: defaults),
+            recoveryStore: RecoveryStore(directoryURL: recoveryURL),
+            userDefaults: defaults
+        )
+    }
+
+    private func makeUserDefaultsSuite() throws -> (defaults: UserDefaults, name: String) {
+        let name = "WorkspaceRenameTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        addTeardownBlock {
+            UserDefaults(suiteName: name)?.removePersistentDomain(forName: name)
+        }
+        return (defaults, name)
+    }
+
+    private func editorSelectionsKey(for vaultURL: URL) -> String {
+        "editorSelections::" + vaultURL.standardizedFileURL.path
     }
 }

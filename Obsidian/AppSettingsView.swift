@@ -304,24 +304,14 @@ struct AppSettingsView: View {
         fractionLength: Int = 0,
         suffix: String
     ) -> some View {
-        let displayValue = value.wrappedValue.formatted(.number.precision(.fractionLength(fractionLength))) + suffix
-
-        return LabeledContent(title) {
-            HStack(spacing: 12) {
-                Slider(value: value, in: range, step: step) {
-                    Text(title)
-                }
-                .labelsHidden()
-                .accessibilityValue(displayValue)
-
-                Text(displayValue)
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-                    .frame(width: 58, alignment: .trailing)
-                    .accessibilityHidden(true)
-            }
-            .frame(width: 230)
-        }
+        PreferenceSliderRow(
+            title,
+            value: value,
+            range: range,
+            step: step,
+            fractionLength: fractionLength,
+            suffix: suffix
+        )
     }
 
     private func textFieldRow(
@@ -383,5 +373,116 @@ struct AppSettingsView: View {
                 workflowConfiguration.templates = configuration
             }
         )
+    }
+}
+
+/// A slider whose knob drives a local mirror of the preference. The bound
+/// preference persists to UserDefaults and re-highlights the editor on every
+/// write, so during a drag the mirror is committed at most every
+/// `dragCommitInterval` (keeping the text previews and editor following the
+/// drag) and finally once editing ends, while the displayed value stays live.
+private struct PreferenceSliderRow: View {
+    let title: String
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    let step: Double
+    let fractionLength: Int
+    let suffix: String
+
+    @State private var draft: Double
+    @State private var isEditing = false
+    @State private var dragCommit: Task<Void, Never>?
+
+    private static let dragCommitInterval: Duration = .milliseconds(120)
+
+    init(
+        _ title: String,
+        value: Binding<Double>,
+        range: ClosedRange<Double>,
+        step: Double = 1,
+        fractionLength: Int = 0,
+        suffix: String
+    ) {
+        self.title = title
+        _value = value
+        self.range = range
+        self.step = step
+        self.fractionLength = fractionLength
+        self.suffix = suffix
+        _draft = State(initialValue: value.wrappedValue)
+    }
+
+    var body: some View {
+        let displayValue = draft.formatted(.number.precision(.fractionLength(fractionLength))) + suffix
+
+        LabeledContent(title) {
+            HStack(spacing: 12) {
+                Slider(
+                    value: $draft,
+                    in: range,
+                    step: step,
+                    label: {
+                        Text(title)
+                    },
+                    onEditingChanged: { editing in
+                        isEditing = editing
+                        if !editing {
+                            dragCommit?.cancel()
+                            dragCommit = nil
+                            commit()
+                        }
+                    }
+                )
+                .labelsHidden()
+                .accessibilityValue(displayValue)
+
+                Text(displayValue)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .frame(width: 58, alignment: .trailing)
+                    .accessibilityHidden(true)
+            }
+            .frame(width: 230)
+        }
+        .onChange(of: draft) { _, _ in
+            // Keyboard changes report at most a single editing transition, so
+            // commit right away whenever no drag is in progress.
+            if !isEditing {
+                commit()
+            } else {
+                scheduleDragCommit()
+            }
+        }
+        .onChange(of: value) { _, newValue in
+            // Follow the preference when it changes elsewhere, or is clamped
+            // on write, without fighting an in-progress drag.
+            if !isEditing, draft != newValue {
+                draft = newValue
+            }
+        }
+        .onDisappear {
+            dragCommit?.cancel()
+            dragCommit = nil
+            if isEditing {
+                commit()
+            }
+        }
+    }
+
+    /// Trailing throttle: at most one preference write per interval while
+    /// the knob is being dragged.
+    private func scheduleDragCommit() {
+        guard dragCommit == nil else { return }
+        dragCommit = Task { @MainActor in
+            try? await Task.sleep(for: Self.dragCommitInterval)
+            guard !Task.isCancelled else { return }
+            dragCommit = nil
+            commit()
+        }
+    }
+
+    private func commit() {
+        guard value != draft else { return }
+        value = draft
     }
 }

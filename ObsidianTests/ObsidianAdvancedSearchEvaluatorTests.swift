@@ -135,6 +135,95 @@ final class ObsidianAdvancedSearchEvaluatorTests: XCTestCase {
         }
     }
 
+    func testTextPredicateFoldsCaseAndDiacriticsAcrossTitlePathAndBody() {
+        let entries = [
+            entry(title: "Cafe\u{301}", path: "menu/Cafe.md", body: "Espresso only."),
+            entry(title: "Été", path: "saisons/E\u{301}te\u{301}.md", body: "chaleur"),
+            entry(title: "Plain", path: "Plain.md", body: "A re\u{301}sume\u{301} inside the body."),
+            entry(title: "Notes", path: "Archives/misc.md", body: "nothing here"),
+        ]
+
+        // `-tag:` keeps every query on the advanced evaluator path.
+        XCTAssertEqual(
+            ObsidianAdvancedSearchEvaluator.search(entries, query: "CAFE -tag:archive").map(\.title),
+            ["Café"]
+        )
+        XCTAssertEqual(
+            ObsidianAdvancedSearchEvaluator.search(entries, query: "ete -tag:archive").map(\.title),
+            ["Été"]
+        )
+        XCTAssertEqual(
+            ObsidianAdvancedSearchEvaluator.search(entries, query: "archives -tag:archive").map(\.title),
+            ["Notes"]
+        )
+
+        let bodyResults = ObsidianAdvancedSearchEvaluator.search(entries, query: "RÉSUMÉ -tag:archive")
+        XCTAssertEqual(bodyResults.map(\.title), ["Plain"])
+        XCTAssertEqual(bodyResults.map(\.isBodyMatch), [true])
+        XCTAssertTrue(bodyResults[0].subtitle?.contains("re\u{301}sume\u{301}") == true)
+
+        XCTAssertEqual(
+            ObsidianAdvancedSearchEvaluator.search(entries, query: "-cafe -tag:archive").map(\.title),
+            ["Été", "Plain", "Notes"]
+        )
+    }
+
+    func testFilePathAndTagPredicatesFoldLikeTextPredicates() {
+        let entries = [
+            entry(title: "kapi", path: "docs/kapi.md", body: "kapi door"),
+            entry(title: "Other", path: "docs/other.md", body: "nothing"),
+        ]
+
+        // The text term and the file/path terms agree on dotless i.
+        XCTAssertEqual(
+            ObsidianAdvancedSearchEvaluator.search(entries, query: "kap\u{131} file:kap\u{131}").map(\.title),
+            ["kapi"]
+        )
+        XCTAssertEqual(
+            ObsidianAdvancedSearchEvaluator.search(entries, query: "kapi path:KAP\u{131}").map(\.title),
+            ["kapi"]
+        )
+        XCTAssertEqual(
+            ObsidianAdvancedSearchEvaluator.search(entries, query: "-file:KAP\u{131} -tag:x").map(\.title),
+            ["Other"]
+        )
+    }
+
+    func testTaskSummaryCapturesStatesAndFoldedLinesOnce() {
+        let summary = NoteTaskSummary.make(
+            from: "Intro\n- [ ] Ship Re\u{301}sume\u{301}\r\n  * [X] Done\n- [y] Not a task\nInline - [ ] no"
+        )
+
+        XCTAssertTrue(summary.hasAnyTask)
+        XCTAssertTrue(summary.hasOpenTask)
+        XCTAssertTrue(summary.hasDoneTask)
+        XCTAssertEqual(summary.taskLines, ["- [ ] Ship Re\u{301}sume\u{301}", "  * [X] Done"])
+        XCTAssertEqual(summary.foldedTaskLines, ["- [ ] ship resume", "  * [x] done"])
+
+        XCTAssertEqual(NoteTaskSummary.make(from: ""), .empty)
+        XCTAssertEqual(NoteTaskSummary.make(from: "Nothing to do"), .empty)
+        XCTAssertFalse(NoteTaskSummary.make(from: "- [ ] open only").hasDoneTask)
+        XCTAssertFalse(NoteTaskSummary.make(from: "+ [x] done only").hasOpenTask)
+
+        let body = SearchableNoteBody("- [ ] cached")
+        XCTAssertEqual(body.taskSummary, body.taskSummary)
+        XCTAssertEqual(body.taskSummary.taskLines, ["- [ ] cached"])
+    }
+
+    func testTaskTextFilterFoldsQueryAndIgnoresNonTaskLines() {
+        let entries = [
+            entry(title: "Todo", path: "Todo.md", body: "- [ ] Ship Re\u{301}sume\u{301}\n- [x] Archive old"),
+            entry(title: "Prose", path: "Prose.md", body: "Re\u{301}sume\u{301} is mentioned but not a task."),
+        ]
+
+        XCTAssertEqual(ObsidianAdvancedSearchEvaluator.search(entries, query: "task:RESUME").map(\.title), ["Todo"])
+        XCTAssertEqual(ObsidianAdvancedSearchEvaluator.search(entries, query: "task:résumé").map(\.title), ["Todo"])
+        XCTAssertEqual(ObsidianAdvancedSearchEvaluator.search(entries, query: "task:archive").map(\.title), ["Todo"])
+        XCTAssertTrue(ObsidianAdvancedSearchEvaluator.search(entries, query: "task:mentioned").isEmpty)
+        XCTAssertEqual(ObsidianAdvancedSearchEvaluator.search(entries, query: "-task:any").map(\.title), ["Prose"])
+        XCTAssertEqual(ObsidianAdvancedSearchEvaluator.search(entries, query: "task:open task:done").map(\.title), ["Todo"])
+    }
+
     private func entry(
         title: String,
         path: String,

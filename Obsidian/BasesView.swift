@@ -15,67 +15,61 @@ struct BasesView: View {
     @State private var query = ""
     @State private var selectedProperty = ""
     @State private var selectedTag = ""
+    // Parsed once per index revision, off the main actor, instead of
+    // re-parsing every note's metadata several times per render on each
+    // keystroke in the filter field. The picker option lists are derived in
+    // the same pass because they depend only on the rows.
+    @State private var rows: [BaseNoteRow] = []
+    // False until the first parse for this view finishes, so an empty `rows`
+    // is not mistaken for "no matching notes".
+    @State private var hasLoaded = false
+    @State private var propertyNames: [String] = []
+    @State private var tagNames: [String] = []
 
-    private var rows: [BaseNoteRow] {
-        workspace.files.compactMap { file -> BaseNoteRow? in
-            guard let body = workspace.noteBody(for: file.url) else { return nil }
-            let metadata = ObsidianMetadataParser.parse(body)
-            return BaseNoteRow(
-                url: file.url,
-                title: metadata.title ?? workspace.title(for: file),
-                path: workspace.relativePath(for: file) ?? file.url.lastPathComponent,
-                tags: metadata.tags,
-                properties: metadata.properties,
-                modifiedAt: file.modificationDate
-            )
-        }
+    private struct RefreshKey: Equatable {
+        let revision: UInt64
+        let vaultURL: URL?
     }
 
-    private var propertyNames: [String] {
-        Set(rows.flatMap { $0.properties.keys }).sorted()
-    }
-
-    private var tagNames: [String] {
-        Set(rows.flatMap(\.tags)).sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
-    }
-
-    private var filteredRows: [BaseNoteRow] {
-        rows.filter { row in
-            let matchesQuery = query.isEmpty
-                || row.title.localizedCaseInsensitiveContains(query)
-                || row.path.localizedCaseInsensitiveContains(query)
-                || row.tags.contains(where: { $0.localizedCaseInsensitiveContains(query) })
-            let matchesProperty = selectedProperty.isEmpty || row.properties[selectedProperty] != nil
-            let matchesTag = selectedTag.isEmpty || row.tags.contains {
-                $0.caseInsensitiveCompare(selectedTag) == .orderedSame
-            }
-            return matchesQuery && matchesProperty && matchesTag
-        }
-        .sorted { $0.modifiedAt > $1.modifiedAt }
+    private var refreshKey: RefreshKey {
+        RefreshKey(revision: workspace.searchIndexRevision, vaultURL: workspace.vaultURL)
     }
 
     var body: some View {
+        let visibleRows = Self.filteredRows(
+            rows,
+            query: query,
+            property: selectedProperty,
+            tag: selectedTag
+        )
+
         VStack(spacing: 0) {
-            controls
+            controls(resultCount: hasLoaded ? visibleRows.count : nil)
             Divider()
 
-            if filteredRows.isEmpty {
+            if !hasLoaded {
+                ProgressView("Loading notes…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if visibleRows.isEmpty {
                 ContentUnavailableView.search(text: query)
             } else {
                 switch layout {
                 case .table:
-                    tableView
+                    tableView(visibleRows)
                 case .list:
-                    listView
+                    listView(visibleRows)
                 case .cards:
-                    cardsView
+                    cardsView(visibleRows)
                 }
             }
         }
         .background(Color(nsColor: .textBackgroundColor))
+        .task(id: refreshKey) {
+            await reloadRows()
+        }
     }
 
-    private var controls: some View {
+    private func controls(resultCount: Int?) -> some View {
         HStack(spacing: 10) {
             TextField("Filter notes…", text: $query)
                 .textFieldStyle(.roundedBorder)
@@ -103,14 +97,14 @@ struct BasesView: View {
             .pickerStyle(.segmented)
             .frame(width: 190)
 
-            Text("\(filteredRows.count) notes")
+            Text(resultCount.map { "\($0) notes" } ?? "Loading…")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
         .padding(12)
     }
 
-    private var tableView: some View {
+    private func tableView(_ visibleRows: [BaseNoteRow]) -> some View {
         ScrollView([.horizontal, .vertical]) {
             LazyVStack(spacing: 0) {
                 HStack(spacing: 12) {
@@ -123,7 +117,7 @@ struct BasesView: View {
                 .padding(.vertical, 8)
                 .background(.bar)
 
-                ForEach(filteredRows) { row in
+                ForEach(visibleRows) { row in
                     Button {
                         onOpenNote(row.url)
                     } label: {
@@ -158,8 +152,8 @@ struct BasesView: View {
         }
     }
 
-    private var listView: some View {
-        List(filteredRows) { row in
+    private func listView(_ visibleRows: [BaseNoteRow]) -> some View {
+        List(visibleRows) { row in
             Button {
                 onOpenNote(row.url)
             } label: {
@@ -190,10 +184,10 @@ struct BasesView: View {
         .listStyle(.inset)
     }
 
-    private var cardsView: some View {
+    private func cardsView(_ visibleRows: [BaseNoteRow]) -> some View {
         ScrollView {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 240), spacing: 12)], spacing: 12) {
-                ForEach(filteredRows) { row in
+                ForEach(visibleRows) { row in
                     Button {
                         onOpenNote(row.url)
                     } label: {
@@ -247,9 +241,86 @@ struct BasesView: View {
         case nil: ""
         }
     }
+
+    // MARK: - Row loading
+
+    /// Snapshots the note bodies and titles on the main actor, then parses the
+    /// metadata off it so a large vault does not stall the filter field.
+    private func reloadRows() async {
+        let sources = workspace.files.compactMap { file -> BaseNoteSource? in
+            guard let body = workspace.noteBody(for: file.url) else { return nil }
+            return BaseNoteSource(
+                url: file.url,
+                fallbackTitle: workspace.title(for: file),
+                path: workspace.relativePath(for: file) ?? file.url.lastPathComponent,
+                modifiedAt: file.modificationDate,
+                body: body
+            )
+        }
+        let table = await Task.detached(priority: .userInitiated) {
+            Self.makeTable(from: sources)
+        }.value
+        guard !Task.isCancelled else { return }
+        rows = table.rows
+        propertyNames = table.propertyNames
+        tagNames = table.tagNames
+        hasLoaded = true
+    }
+
+    nonisolated private static func makeTable(from sources: [BaseNoteSource]) -> BaseNoteTable {
+        let rows = sources.map { source -> BaseNoteRow in
+            let metadata = ObsidianMetadataParser.parse(source.body)
+            return BaseNoteRow(
+                url: source.url,
+                title: metadata.title ?? source.fallbackTitle,
+                path: source.path,
+                tags: metadata.tags,
+                properties: metadata.properties,
+                modifiedAt: source.modifiedAt
+            )
+        }
+        let propertyNames = Set(rows.flatMap { $0.properties.keys }).sorted()
+        let tagNames = Set(rows.flatMap(\.tags))
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        return BaseNoteTable(rows: rows, propertyNames: propertyNames, tagNames: tagNames)
+    }
+
+    nonisolated private static func filteredRows(
+        _ rows: [BaseNoteRow],
+        query: String,
+        property: String,
+        tag: String
+    ) -> [BaseNoteRow] {
+        rows.filter { row in
+            let matchesQuery = query.isEmpty
+                || row.title.localizedCaseInsensitiveContains(query)
+                || row.path.localizedCaseInsensitiveContains(query)
+                || row.tags.contains(where: { $0.localizedCaseInsensitiveContains(query) })
+            let matchesProperty = property.isEmpty || row.properties[property] != nil
+            let matchesTag = tag.isEmpty || row.tags.contains {
+                $0.caseInsensitiveCompare(tag) == .orderedSame
+            }
+            return matchesQuery && matchesProperty && matchesTag
+        }
+        .sorted { $0.modifiedAt > $1.modifiedAt }
+    }
 }
 
-private struct BaseNoteRow: Identifiable {
+private struct BaseNoteSource: Sendable {
+    let url: URL
+    let fallbackTitle: String
+    let path: String
+    let modifiedAt: Date
+    let body: String
+}
+
+private struct BaseNoteTable: Sendable {
+    let rows: [BaseNoteRow]
+    let propertyNames: [String]
+    let tagNames: [String]
+}
+
+private struct BaseNoteRow: Identifiable, Sendable {
     let url: URL
     let title: String
     let path: String

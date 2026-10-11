@@ -343,6 +343,7 @@ final class EditorLinkPreviewTests: XCTestCase {
             snapshotDirectoryURL: snapshotDirectory
         )
         firstCache.saveXHeight(438, for: "2031783721397809397")
+        firstCache.flushPendingHeightWrites()
 
         let representation = try XCTUnwrap(
             NSBitmapImageRep(
@@ -438,10 +439,13 @@ final class EditorLinkPreviewTests: XCTestCase {
         XCTAssertEqual(previews[1].kind, .youtube(videoID: "AVEZBy1uAk8"))
         XCTAssertEqual(previews[1].youtubeStartSeconds, 2299)
         XCTAssertEqual(previews[2].kind, .youtube(videoID: "dQw4w9WgXcQ"))
-        XCTAssertEqual(
-            previews[1].thumbnailURL?.absoluteString,
-            "https://i.ytimg.com/vi/AVEZBy1uAk8/mqdefault.jpg"
-        )
+        XCTAssertEqual(previews[1].thumbnailURLs.map(\.absoluteString), [
+            "https://i.ytimg.com/vi/AVEZBy1uAk8/maxresdefault.jpg",
+            "https://i.ytimg.com/vi/AVEZBy1uAk8/hqdefault.jpg"
+        ])
+        XCTAssertEqual(previews[0].thumbnailURLs, [])
+        XCTAssertEqual(YouTubeThumbnail.urls(videoID: "../x"), [])
+        XCTAssertEqual(YouTubeThumbnail.urls(videoID: "vidéo"), [])
     }
 
     func testUsesMarkdownLinkLabelAndSupportsTwitterHost() {
@@ -530,8 +534,6 @@ final class EditorLinkPreviewTests: XCTestCase {
 
     func testXEmbedHTMLUsesOfficialWidgetAndPrivacyMode() {
         let html = XPostEmbedHTML.document(
-            postURL: URL(string: "https://x.com/TheCinesthetic/status/2006003135551266961")!,
-            username: "TheCinesthetic",
             statusID: "2006003135551266961",
             theme: "dark"
         )

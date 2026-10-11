@@ -320,6 +320,37 @@ final class SyntaxHighlighter {
         let metaAttributes: [NSAttributedString.Key: Any]
     }
 
+    /// What the single per-keystroke document walk learned about the span it
+    /// hands back, so `highlight(_:range:codeBlockState:)` can skip the
+    /// document-wide fence scan instead of rediscovering the code-block layout.
+    enum CodeBlockState: Equatable {
+        /// The range covers whole paragraphs that lie outside every fenced
+        /// code block, so inline highlighting alone is enough.
+        case outsideCodeBlock
+        /// The range is exactly one fenced code block (fences included), so the
+        /// code style applies to all of it and inline highlighting is skipped.
+        case wholeCodeBlock
+    }
+
+    /// The span an incremental edit needs re-highlighted, together with the
+    /// code-block knowledge gathered while computing it.
+    struct IncrementalRange: Equatable {
+        let range: NSRange
+        let codeBlockState: CodeBlockState
+    }
+
+    private struct FenceMarker: Equatable {
+        let character: unichar
+        let length: Int
+
+        /// A fence line closes an open block only when it uses the same
+        /// character and is at least as long as the opening fence, matching
+        /// the preview, metadata parser and link extractor.
+        func closes(_ opening: FenceMarker) -> Bool {
+            character == opening.character && length >= opening.length
+        }
+    }
+
     private let preferences: AppPreferences
     private var cachedStyleSignature: StyleSignature?
     private var cachedStyles: Styles?
@@ -328,40 +359,76 @@ final class SyntaxHighlighter {
         self.preferences = preferences
     }
 
-    /// Reports whether an edit touching `editedRange` forces a full-document
-    /// re-highlight (rather than a cheap incremental paragraph/code-block pass).
-    /// Fence-affecting edits invalidate code-block parity for the whole
-    /// document, so callers can coalesce these expensive passes off the
-    /// per-keystroke path instead of running one synchronously each time.
-    func requiresFullRehighlight(for editedRange: NSRange?, in textStorage: NSTextStorage) -> Bool {
-        guard editedRange != nil else { return true }
+    /// Computes the span an edit touching `editedRange` needs re-highlighted.
+    /// Returns `nil` when the edit forces a full-document pass: fence-affecting
+    /// edits invalidate code-block parity for the whole document, so callers
+    /// can coalesce those expensive passes off the per-keystroke path instead
+    /// of running one synchronously each time.
+    ///
+    /// This is the only document walk on the per-keystroke path. Callers hand
+    /// the result to `highlight(_:range:codeBlockState:)`, which then needs no
+    /// further scan to know whether the span is a plain paragraph or a whole
+    /// code block.
+    func incrementalRange(for editedRange: NSRange?, in textStorage: NSTextStorage) -> IncrementalRange? {
+        guard let editedRange else { return nil }
+
         let text = textStorage.string as NSString
         let fullRange = NSRange(location: 0, length: text.length)
-        return incrementalHighlightRange(for: editedRange, in: text, fullRange: fullRange) == nil
+        guard fullRange.length > 0 else {
+            return IncrementalRange(range: fullRange, codeBlockState: .outsideCodeBlock)
+        }
+
+        let clampedLocation = min(max(editedRange.location, 0), fullRange.length)
+        let clampedLength = min(max(editedRange.length, 0), max(0, fullRange.length - clampedLocation))
+        let clampedRange = NSRange(location: clampedLocation, length: clampedLength)
+        let probeRange = probeRange(for: clampedRange, fullRange: fullRange)
+        let paragraphRange = text.paragraphRange(for: probeRange)
+
+        if paragraphMayAffectCodeBlockState(paragraphRange, in: text) {
+            return nil
+        }
+
+        if let codeBlockRange = codeBlockRange(containing: probeRange.location, in: text) {
+            return IncrementalRange(range: codeBlockRange, codeBlockState: .wholeCodeBlock)
+        }
+
+        return IncrementalRange(range: paragraphRange, codeBlockState: .outsideCodeBlock)
     }
 
-    func highlight(_ textStorage: NSTextStorage, editedRange: NSRange? = nil) {
+    /// Full-document pass: resets every attribute, then colors fenced code
+    /// blocks and runs inline highlighting over everything outside them.
+    func highlight(_ textStorage: NSTextStorage) {
         let text = textStorage.string as NSString
         let fullRange = NSRange(location: 0, length: text.length)
-        let targetRange = incrementalHighlightRange(
-            for: editedRange,
-            in: text,
-            fullRange: fullRange
-        ) ?? fullRange
 
         let styles = currentStyles()
         textStorage.beginEditing()
-        textStorage.setAttributes(styles.defaultAttributes, range: targetRange)
+        textStorage.setAttributes(styles.defaultAttributes, range: fullRange)
 
-        let codeBlockRanges = highlightCodeBlocks(
-            textStorage,
-            text: text,
-            intersecting: targetRange,
-            styles: styles
-        )
-        let safeRanges = subtractRanges(codeBlockRanges, from: targetRange)
+        let codeBlockRanges = highlightCodeBlocks(textStorage, text: text, styles: styles)
+        let safeRanges = subtractRanges(codeBlockRanges, from: fullRange)
 
         for range in safeRanges {
+            highlightInRange(textStorage, text: text, range: range, styles: styles)
+        }
+
+        textStorage.endEditing()
+    }
+
+    /// Incremental pass over the span `incrementalRange(for:in:)` returned. The
+    /// code-block state decided there is reused here, so a paragraph outside
+    /// any fence skips the fence scan entirely and a whole code block takes
+    /// the code style directly.
+    func highlight(_ textStorage: NSTextStorage, range: NSRange, codeBlockState: CodeBlockState) {
+        let styles = currentStyles()
+        textStorage.beginEditing()
+        textStorage.setAttributes(styles.defaultAttributes, range: range)
+
+        switch codeBlockState {
+        case .wholeCodeBlock:
+            applyCodeBlockStyle(textStorage, range: range, styles: styles)
+        case .outsideCodeBlock:
+            let text = textStorage.string as NSString
             highlightInRange(textStorage, text: text, range: range, styles: styles)
         }
 
@@ -373,40 +440,14 @@ final class SyntaxHighlighter {
     private func highlightCodeBlocks(
         _ textStorage: NSTextStorage,
         text: NSString,
-        intersecting targetRange: NSRange,
         styles: Styles
     ) -> [NSRange] {
         var ranges: [NSRange] = []
-        var inCodeBlock = false
-        var blockStart = 0
-        enumerateLines(in: text) { lineRange, contentRange in
-            guard isFenceLine(contentRange, in: text) else { return true }
-
-            if inCodeBlock {
-                let range = NSRange(location: blockStart, length: max(0, NSMaxRange(contentRange) - blockStart))
-                let intersection = NSIntersectionRange(range, targetRange)
-                if intersection.length > 0 {
-                    applyCodeBlockStyle(textStorage, range: intersection, styles: styles)
-                    ranges.append(intersection)
-                }
-                inCodeBlock = false
-            } else {
-                blockStart = lineRange.location
-                inCodeBlock = true
-            }
-
+        enumerateCodeBlocks(in: text) { range in
+            applyCodeBlockStyle(textStorage, range: range, styles: styles)
+            ranges.append(range)
             return true
         }
-
-        if inCodeBlock {
-            let range = NSRange(location: blockStart, length: max(0, text.length - blockStart))
-            let intersection = NSIntersectionRange(range, targetRange)
-            if intersection.length > 0 {
-                applyCodeBlockStyle(textStorage, range: intersection, styles: styles)
-                ranges.append(intersection)
-            }
-        }
-
         return ranges
     }
 
@@ -712,31 +753,6 @@ final class SyntaxHighlighter {
         return styles
     }
 
-    private func incrementalHighlightRange(
-        for editedRange: NSRange?,
-        in text: NSString,
-        fullRange: NSRange
-    ) -> NSRange? {
-        guard let editedRange else { return nil }
-        guard fullRange.length > 0 else { return fullRange }
-
-        let clampedLocation = min(max(editedRange.location, 0), fullRange.length)
-        let clampedLength = min(max(editedRange.length, 0), max(0, fullRange.length - clampedLocation))
-        let clampedRange = NSRange(location: clampedLocation, length: clampedLength)
-        let probeRange = probeRange(for: clampedRange, fullRange: fullRange)
-        let paragraphRange = text.paragraphRange(for: probeRange)
-
-        if paragraphMayAffectCodeBlockState(paragraphRange, in: text) {
-            return nil
-        }
-
-        if let codeBlockRange = codeBlockRange(containing: probeRange.location, in: text, fullLength: fullRange.length) {
-            return codeBlockRange
-        }
-
-        return paragraphRange
-    }
-
     private func probeRange(for editedRange: NSRange, fullRange: NSRange) -> NSRange {
         guard editedRange.length == 0 else { return editedRange }
 
@@ -754,7 +770,7 @@ final class SyntaxHighlighter {
             let fullLineRange = text.lineRange(for: NSRange(location: location, length: 0))
             let lineRange = NSIntersectionRange(fullLineRange, range)
             let lineContentRange = contentRange(forLineRange: lineRange, in: text)
-            if isFenceLine(lineContentRange, in: text) {
+            if fenceMarker(for: lineContentRange, in: text) != nil {
                 return true
             }
 
@@ -766,36 +782,55 @@ final class SyntaxHighlighter {
         return false
     }
 
-    private func codeBlockRange(containing location: Int, in text: NSString, fullLength: Int) -> NSRange? {
-        var inCodeBlock = false
-        var blockStart = 0
+    /// The fenced code block that contains `location`, including the position
+    /// just past the closing fence's content (the fence line's terminator).
+    private func codeBlockRange(containing location: Int, in text: NSString) -> NSRange? {
         var matchedRange: NSRange?
 
-        enumerateLines(in: text) { lineRange, contentRange in
-            guard isFenceLine(contentRange, in: text) else { return true }
+        enumerateCodeBlocks(in: text) { range in
+            // Blocks arrive in document order, so once one starts past the
+            // location no later block can contain it.
+            guard range.location <= location else { return false }
 
-            if inCodeBlock {
-                let range = NSRange(location: blockStart, length: max(0, NSMaxRange(contentRange) - blockStart))
-                if NSLocationInRange(location, range) || location == NSMaxRange(range) {
-                    matchedRange = range
-                    return false
-                }
-                inCodeBlock = false
-            } else {
-                blockStart = lineRange.location
-                inCodeBlock = true
+            if NSLocationInRange(location, range) || location == NSMaxRange(range) {
+                matchedRange = range
+                return false
             }
-
             return true
         }
 
-        if let matchedRange {
-            return matchedRange
+        return matchedRange
+    }
+
+    /// Walks the document once, reporting every fenced code block in order:
+    /// from the start of its opening fence line through the end of its closing
+    /// fence's content, or through the end of the text when it is never
+    /// closed. A block closes only on a fence that matches its opening marker.
+    /// The body returns `false` to stop early.
+    private func enumerateCodeBlocks(in text: NSString, _ body: (NSRange) -> Bool) {
+        var openingFence: FenceMarker?
+        var blockStart = 0
+
+        enumerateLines(in: text) { lineRange, contentRange in
+            guard let marker = fenceMarker(for: contentRange, in: text) else { return true }
+
+            if let opening = openingFence {
+                guard marker.closes(opening) else { return true }
+
+                openingFence = nil
+                let range = NSRange(location: blockStart, length: max(0, NSMaxRange(contentRange) - blockStart))
+                return body(range)
+            }
+
+            openingFence = marker
+            blockStart = lineRange.location
+            return true
         }
 
-        guard inCodeBlock else { return nil }
-        let range = NSRange(location: blockStart, length: max(0, fullLength - blockStart))
-        return location >= blockStart ? range : nil
+        if openingFence != nil {
+            let range = NSRange(location: blockStart, length: max(0, text.length - blockStart))
+            _ = body(range)
+        }
     }
 
     private func enumerateLines(
@@ -824,14 +859,26 @@ final class SyntaxHighlighter {
         return NSRange(location: lineRange.location, length: end - lineRange.location)
     }
 
-    private func isFenceLine(_ range: NSRange, in text: NSString) -> Bool {
-        let trimmedStart = skipLeadingWhitespace(in: range, text: text)
-        let available = NSMaxRange(range) - trimmedStart
-        guard available >= 3 else { return false }
+    /// Recognizes a fence line: optional leading whitespace followed by a run
+    /// of at least three backticks or tildes (anything after the run, such as
+    /// a language tag, is ignored). The run's character and length are what a
+    /// closing fence is matched against, in line with the preview, metadata
+    /// parser and link extractor.
+    private func fenceMarker(for range: NSRange, in text: NSString) -> FenceMarker? {
+        let start = skipLeadingWhitespace(in: range, text: text)
+        let end = NSMaxRange(range)
+        guard start < end else { return nil }
 
-        return text.character(at: trimmedStart) == 96 &&
-            text.character(at: trimmedStart + 1) == 96 &&
-            text.character(at: trimmedStart + 2) == 96
+        let character = text.character(at: start)
+        guard character == 96 || character == 126 else { return nil }
+
+        var location = start
+        while location < end, text.character(at: location) == character {
+            location += 1
+        }
+
+        let length = location - start
+        return length >= 3 ? FenceMarker(character: character, length: length) : nil
     }
 
     private func headingLevel(for range: NSRange, in text: NSString) -> Int? {

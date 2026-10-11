@@ -52,6 +52,7 @@ final class NoteWorkflowServicesTests: XCTestCase {
             in: vault,
             date: date,
             timeZone: utc,
+            locale: Locale(identifier: "en_US_POSIX"),
             configuration: DailyNoteConfiguration(
                 folderPath: "Journal",
                 dateFormat: "YYYY/MM/DD",
@@ -83,6 +84,7 @@ final class NoteWorkflowServicesTests: XCTestCase {
             in: vault,
             date: date,
             timeZone: TimeZone(secondsFromGMT: 0)!,
+            locale: Locale(identifier: "en_US_POSIX"),
             configuration: .default
         )
 
@@ -133,6 +135,7 @@ final class NoteWorkflowServicesTests: XCTestCase {
                 in: vault,
                 date: date,
                 timeZone: TimeZone(secondsFromGMT: 0)!,
+                locale: Locale(identifier: "en_US_POSIX"),
                 configuration: DailyNoteConfiguration(
                     folderPath: "../Outside",
                     dateFormat: "YYYY-MM-DD",
@@ -250,6 +253,246 @@ final class NoteWorkflowServicesTests: XCTestCase {
         XCTAssertEqual(NoteWorkflowConfigurationStore(userDefaults: fixture.defaults).dailyNotes, .default)
         XCTAssertTrue(RecentVaultStore(userDefaults: fixture.defaults).records.isEmpty)
         XCTAssertTrue(SavedAdvancedSearchStore(userDefaults: fixture.defaults).searches.isEmpty)
+    }
+
+    func testDateFormatQuotesLiteralsMapsTokensIndividuallyAndRejectsOrdinals() throws {
+        XCTAssertEqual(try ObsidianDateFormat.foundationFormat(from: "[Daily] YYYY-MM-DD"), "'Daily' yyyy-MM-dd")
+        XCTAssertEqual(try ObsidianDateFormat.foundationFormat(from: "YYYY-MM-DD dddd"), "yyyy-MM-dd EEEE")
+        XCTAssertEqual(try ObsidianDateFormat.foundationFormat(from: "[Week's] YYYY"), "'Week''s' yyyy")
+        XCTAssertThrowsError(try ObsidianDateFormat.foundationFormat(from: "Do MMMM YYYY")) { error in
+            XCTAssertEqual(error as? NoteWorkflowFileError, .invalidDateFormat)
+        }
+        XCTAssertThrowsError(try ObsidianDateFormat.foundationFormat(from: "[Unclosed YYYY")) { error in
+            XCTAssertEqual(error as? NoteWorkflowFileError, .invalidDateFormat)
+        }
+    }
+
+    func testDailyNotePathLocalizesNamesButKeepsLatinDigits() throws {
+        let date = try fixedDate(year: 2026, month: 7, day: 12)
+        let utc = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let posix = Locale(identifier: "en_US_POSIX")
+
+        XCTAssertEqual(
+            try DailyNoteService.relativeDatedPath(for: date, dateFormat: "[Daily] YYYY-MM-DD", timeZone: utc, locale: posix),
+            "Daily 2026-07-12.md"
+        )
+        XCTAssertEqual(
+            try DailyNoteService.relativeDatedPath(for: date, dateFormat: "YYYY-MM-DD dddd", timeZone: utc, locale: posix),
+            "2026-07-12 Sunday.md"
+        )
+        XCTAssertEqual(
+            try DailyNoteService.relativeDatedPath(
+                for: date,
+                dateFormat: "YYYY-MM-DD dddd",
+                timeZone: utc,
+                locale: Locale(identifier: "de_DE")
+            ),
+            "2026-07-12 Sonntag.md"
+        )
+        XCTAssertEqual(
+            try DailyNoteService.relativeDatedPath(
+                for: date,
+                dateFormat: "YYYY-MM-DD",
+                timeZone: utc,
+                locale: Locale(identifier: "ar_SA")
+            ),
+            "2026-07-12.md"
+        )
+        XCTAssertThrowsError(
+            try DailyNoteService.relativeDatedPath(for: date, dateFormat: "Do MMMM YYYY", timeZone: utc, locale: posix)
+        ) { error in
+            XCTAssertEqual(error as? NoteWorkflowFileError, .invalidDateFormat)
+        }
+    }
+
+    func testDailyNoteNamesDefaultToEnglishAndIgnoreRegionWeekRules() throws {
+        let date = try fixedDate(year: 2026, month: 7, day: 12)
+        let utc = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+
+        // The default must not depend on Locale.current or the passed region.
+        XCTAssertEqual(
+            try DailyNoteService.relativeDatedPath(for: date, dateFormat: "YYYY-MM-DD dddd", timeZone: utc),
+            "2026-07-12 Sunday.md"
+        )
+        for identifier in ["en_US_POSIX", "en_US", "en_GB", "de_DE"] {
+            XCTAssertEqual(
+                try DailyNoteService.relativeDatedPath(
+                    for: date,
+                    dateFormat: "gggg-[W]ww-d",
+                    timeZone: utc,
+                    locale: Locale(identifier: identifier)
+                ),
+                "2026-W29-0.md",
+                identifier
+            )
+        }
+    }
+
+    func testDateFormatMatchesMomentForWeekdayAndWeekTokens() throws {
+        let sunday = try fixedDate(year: 2026, month: 7, day: 12)
+        let monday = try fixedDate(year: 2026, month: 7, day: 13, hour: 15)
+        let utc = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        func path(_ format: String, _ date: Date) throws -> String {
+            try DailyNoteService.relativeDatedPath(for: date, dateFormat: format, timeZone: utc)
+        }
+
+        XCTAssertEqual(try path("d dd ddd dddd", sunday), "0 Su Sun Sunday.md")
+        XCTAssertEqual(try path("d E", monday), "1 1.md")
+        XCTAssertEqual(try path("E", sunday), "7.md")
+        XCTAssertEqual(try path("[W]WW GGGG", sunday), "W28 2026.md")
+        XCTAssertEqual(try path("w ww", sunday), "29 29.md")
+        XCTAssertEqual(try path("h:mm A a", monday), "3:00 PM pm.md")
+        // Week 1 of 2027 begins on Sunday 2026-12-27 under Moment's en rules.
+        let newYearsEve = try fixedDate(year: 2026, month: 12, day: 31)
+        XCTAssertEqual(try path("gggg-[W]ww GG-[W]WW", newYearsEve), "2027-W01 26-W53.md")
+    }
+
+    func testDateFormatTreatsApostrophesAndStrayBracketsAsText() throws {
+        let date = try fixedDate(year: 2026, month: 7, day: 12)
+        let utc = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        func path(_ format: String) throws -> String {
+            try DailyNoteService.relativeDatedPath(for: date, dateFormat: format, timeZone: utc)
+        }
+
+        XCTAssertEqual(try path("MMM D 'YY"), "Jul 12 '26.md")
+        XCTAssertEqual(try path("[x'] YYYY"), "x' 2026.md")
+        XCTAssertEqual(try path("[a'b] YYYY"), "a'b 2026.md")
+        XCTAssertEqual(try path("YYYY] MM"), "2026] 07.md")
+        XCTAssertEqual(try path("YYYY-MM-DDTHH"), "2026-07-12T12.md")
+        XCTAssertEqual(try path("[A][B] YYYY"), "AB 2026.md")
+        XCTAssertEqual(try path("\\YYYY YYYY"), "YYYY 2026.md")
+        XCTAssertEqual(try ObsidianDateFormat.foundationFormat(from: "[A][B]"), "'AB'")
+    }
+
+    func testDateFormatRejectsEveryOrdinalAndUnrepresentableToken() throws {
+        let date = try fixedDate(year: 2026, month: 7, day: 12)
+        let utc = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let unsupported = [
+            "Do", "Mo YYYY", "DDDo", "do", "Qo", "wo", "Wo", "dddd, MMMM Do YYYY",
+            "SSS", "X", "x", "ZZ", "N", "YYYYYY",
+            // Adjacent same-letter ICU tokens would be fused into one.
+            "MMMMM", "HHH",
+        ]
+        for format in unsupported {
+            XCTAssertThrowsError(
+                try DailyNoteService.relativeDatedPath(for: date, dateFormat: format, timeZone: utc),
+                format
+            ) { error in
+                XCTAssertEqual(error as? NoteWorkflowFileError, .invalidDateFormat, format)
+            }
+        }
+        // The same token inside brackets is plain text.
+        XCTAssertEqual(
+            try DailyNoteService.relativeDatedPath(for: date, dateFormat: "[Do] YYYY", timeZone: utc),
+            "Do 2026.md"
+        )
+    }
+
+    func testDailyNoteOpensExistingEnglishNoteWhenAnotherLocaleIsRequested() throws {
+        let vault = try makeVault()
+        defer { try? FileManager.default.removeItem(at: vault) }
+        let date = try fixedDate(year: 2026, month: 10, day: 11)
+        let utc = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let configuration = DailyNoteConfiguration(
+            folderPath: "",
+            dateFormat: "YYYY-MM-DD dddd",
+            templateRelativePath: nil
+        )
+        let englishURL = vault.appendingPathComponent("2026-10-11 Sunday.md").standardizedFileURL
+        try "Obsidian wrote this".write(to: englishURL, atomically: true, encoding: .utf8)
+
+        let defaulted = try DailyNoteService().createOrOpen(
+            in: vault,
+            date: date,
+            timeZone: utc,
+            configuration: configuration
+        )
+        XCTAssertFalse(defaulted.wasCreated)
+        XCTAssertEqual(defaulted.fileURL, englishURL)
+
+        let german = try DailyNoteService().createOrOpen(
+            in: vault,
+            date: date,
+            timeZone: utc,
+            locale: Locale(identifier: "de_DE"),
+            configuration: configuration
+        )
+        XCTAssertFalse(german.wasCreated)
+        XCTAssertEqual(german.fileURL, englishURL)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: vault.appendingPathComponent("2026-10-11 Sonntag.md").path)
+        )
+
+        // With no English note present, an explicit locale opts in to its names.
+        let otherVault = try makeVault()
+        defer { try? FileManager.default.removeItem(at: otherVault) }
+        let created = try DailyNoteService().createOrOpen(
+            in: otherVault,
+            date: date,
+            timeZone: utc,
+            locale: Locale(identifier: "de_DE"),
+            configuration: configuration
+        )
+        XCTAssertTrue(created.wasCreated)
+        XCTAssertEqual(created.fileURL.lastPathComponent, "2026-10-11 Sonntag.md")
+    }
+
+    func testTemplateNoteRejectsDotPrefixedTitle() throws {
+        let vault = try makeVault()
+        defer { try? FileManager.default.removeItem(at: vault) }
+        let templateFolder = vault.appendingPathComponent("Templates", isDirectory: true)
+        try FileManager.default.createDirectory(at: templateFolder, withIntermediateDirectories: true)
+        let templateURL = templateFolder.appendingPathComponent("Project.md")
+        try "# {{title}}".write(to: templateURL, atomically: true, encoding: .utf8)
+
+        XCTAssertThrowsError(
+            try TemplateNoteService().create(
+                in: vault,
+                title: ".hidden",
+                template: TemplateDescriptor(relativePath: "Project.md", fileURL: templateURL),
+                templateConfiguration: .default
+            )
+        ) { error in
+            guard case NoteWorkflowFileError.unsafeRelativePath = error else {
+                return XCTFail("Expected an unsafe-path error, got \(error)")
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: vault.appendingPathComponent(".hidden.md").path))
+    }
+
+    func testSavedSearchesTreatDiacriticVariantsAsOneName() throws {
+        let fixture = try makeDefaults()
+        defer { fixture.defaults.removePersistentDomain(forName: fixture.suite) }
+        let store = SavedAdvancedSearchStore(userDefaults: fixture.defaults)
+
+        let first = try store.save(name: "Café", query: "tag:#coffee", at: Date(timeIntervalSince1970: 1))
+        let second = try store.save(name: "cafe", query: "tag:#espresso", at: Date(timeIntervalSince1970: 2))
+
+        XCTAssertEqual(second.id, first.id)
+        XCTAssertEqual(store.searches.map(\.name), ["cafe"])
+        XCTAssertEqual(SavedAdvancedSearchStore(userDefaults: fixture.defaults).searches, store.searches)
+    }
+
+    func testSavedSearchLoadKeepsNewestDiacriticVariant() throws {
+        let fixture = try makeDefaults()
+        defer { fixture.defaults.removePersistentDomain(forName: fixture.suite) }
+        let older = SavedAdvancedSearch(
+            id: UUID(),
+            name: "Café",
+            query: "tag:#coffee",
+            createdAt: Date(timeIntervalSince1970: 1),
+            updatedAt: Date(timeIntervalSince1970: 1)
+        )
+        let newer = SavedAdvancedSearch(
+            id: UUID(),
+            name: "Cafe",
+            query: "tag:#espresso",
+            createdAt: Date(timeIntervalSince1970: 2),
+            updatedAt: Date(timeIntervalSince1970: 2)
+        )
+        fixture.defaults.set(try JSONEncoder().encode([older, newer]), forKey: "advancedSearch.savedQueries")
+
+        XCTAssertEqual(SavedAdvancedSearchStore(userDefaults: fixture.defaults).searches, [newer])
     }
 
     private func makeDefaults() throws -> (defaults: UserDefaults, suite: String) {

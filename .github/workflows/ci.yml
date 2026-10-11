@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 concurrency:
@@ -11,13 +12,71 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  # Keep in sync with the version used locally (xcodegen --version).
+  XCODEGEN_VERSION: 2.46.0
+  # sha256 of xcodegen.zip for XCODEGEN_VERSION, from the GitHub release assets.
+  XCODEGEN_SHA256: 4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806
+
 jobs:
   check:
     runs-on: macos-26
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - name: Install XcodeGen
-        run: brew install xcodegen
+      - uses: actions/checkout@v6
+
+      - name: Configure build paths
+        # Both variables are optional knobs read by scripts/check.sh. The
+        # runner context is not available in job-level env, so set them here.
+        # This runs before any step that can fail so the failure() upload
+        # step below always sees XCRESULT_DIR.
+        # The .xcresult sits in its own directory so the uploaded artifact
+        # keeps the bundle name and opens in Xcode after download.
+        run: |
+          echo "SPM_CLONED_SOURCE_PACKAGES_DIR=${RUNNER_TEMP}/spm-packages" >> "$GITHUB_ENV"
+          echo "XCRESULT_DIR=${RUNNER_TEMP}/test-results" >> "$GITHUB_ENV"
+          echo "XCRESULT_PATH=${RUNNER_TEMP}/test-results/Obsidian.xcresult" >> "$GITHUB_ENV"
+
+      - name: Install pinned XcodeGen
+        # The release zip is a universal binary plus the SettingPresets it
+        # looks up relative to itself (bin/../share/xcodegen), so keep its
+        # layout and prepend bin/ to PATH instead of using an unpinned brew.
+        run: |
+          set -euo pipefail
+          install_dir="${RUNNER_TEMP}/xcodegen-${XCODEGEN_VERSION}"
+          mkdir -p "$install_dir"
+          curl --fail --location --silent --show-error --retry 3 \
+            --output "$install_dir/xcodegen.zip" \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip"
+          echo "${XCODEGEN_SHA256}  ${install_dir}/xcodegen.zip" | shasum -a 256 --check
+          unzip -q "$install_dir/xcodegen.zip" -d "$install_dir"
+          echo "${install_dir}/xcodegen/bin" >> "$GITHUB_PATH"
+
+      - name: Log tool versions
+        # The macos-26 image picks its own default Xcode; log it instead of
+        # pinning a path that may not exist on the runner.
+        run: |
+          xcodegen --version
+          xcode-select --print-path
+          xcodebuild -version
+
+      - name: Cache SwiftPM checkouts
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.SPM_CLONED_SOURCE_PACKAGES_DIR }}
+          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
       - name: Run mandatory repository check
         run: bash scripts/check.sh
+
+      - name: Upload test results
+        if: failure() && env.XCRESULT_DIR != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: Obsidian.xcresult
+          path: ${{ env.XCRESULT_DIR }}
+          if-no-files-found: ignore
+          retention-days: 7

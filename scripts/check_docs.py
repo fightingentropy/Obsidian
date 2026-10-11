@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -12,11 +13,25 @@ ROOT = Path(__file__).resolve().parent.parent
 LINK = re.compile(r"(?<!!)\[[^\]]*\]\(([^)]+)\)")
 
 
+def repository_markdown_files() -> list[Path]:
+    """Return tracked and new untracked *.md files, never git-ignored scratch notes."""
+    try:
+        listing = subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "*.md"],
+            capture_output=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f"Could not list repository Markdown files with git: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+    paths = (ROOT / name for name in listing.stdout.decode("utf-8").split("\0") if name)
+    # A tracked file deleted in the working tree has nothing left to lint.
+    return sorted({path for path in paths if path.is_file()})
+
+
 def main() -> int:
     failures: list[str] = []
-    for document in sorted(ROOT.rglob("*.md")):
-        if any(part.startswith(".") or part in {"build", "DerivedData"} for part in document.relative_to(ROOT).parts):
-            continue
+    for document in repository_markdown_files():
         text = document.read_text(encoding="utf-8")
         for match in LINK.finditer(text):
             raw = match.group(1).strip().strip("<>")

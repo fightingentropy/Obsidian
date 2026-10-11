@@ -64,7 +64,7 @@ final class SecurityAndSearchTests: XCTestCase {
             ("Apple", "# Apple\n\nA crunchy fruit"),
             ("Banana", "# Banana\n\nA yellow fruit")
         ])
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
 
@@ -93,7 +93,7 @@ final class SecurityAndSearchTests: XCTestCase {
             ("Igdir", "# IĞDIR\n\nTurkish casing"),
             ("Angstrom", "# A\u{30A}ngström\n\nCanonical normalization")
         ])
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
         let entries = workspace.makeSearchEntries()
@@ -105,23 +105,45 @@ final class SecurityAndSearchTests: XCTestCase {
         XCTAssertEqual(Workspace.search(entries, query: "angstrom").map(\.title), ["Ångström"])
     }
 
-    func testInvalidOrExpiredBookmarkIsRemovedInsteadOfRetriedForever() {
-        let defaults = UserDefaults.standard
-        let key = "vaultBookmark"
-        let previousValue = defaults.data(forKey: key)
-        defer {
-            if let previousValue {
-                defaults.set(previousValue, forKey: key)
-            } else {
-                defaults.removeObject(forKey: key)
-            }
-        }
+    func testInvalidOrExpiredBookmarkIsRemovedInsteadOfRetriedForever() throws {
+        let defaults = try makeUserDefaults()
+        defaults.set(Data("expired-security-scope".utf8), forKey: "vaultBookmark")
 
-        defaults.set(Data("expired-security-scope".utf8), forKey: key)
-        let workspace = Workspace()
+        let workspace = try makeWorkspace(userDefaults: defaults)
 
         XCTAssertNil(workspace.vaultURL)
-        XCTAssertNil(defaults.data(forKey: key))
+        XCTAssertNil(defaults.data(forKey: "vaultBookmark"))
+    }
+
+    func testWorkspacePersistsVaultStateInItsInjectedDefaults() async throws {
+        let fixture = try makeVault(files: [
+            ("Alpha", "# Alpha"),
+            ("Beta", "# Beta")
+        ])
+        let defaults = try makeUserDefaults()
+        let workspace = try makeWorkspace(userDefaults: defaults)
+        workspace.vaultURL = fixture.vaultURL
+        workspace.sortOrder = .byName
+        workspace.refreshFiles()
+        XCTAssertTrue(workspace.selectFile(fixture.fileURLs[1]))
+
+        let vaultPath = fixture.vaultURL.standardizedFileURL.path
+        XCTAssertEqual(defaults.string(forKey: "sortOrder::" + vaultPath), SortOrder.byName.rawValue)
+        XCTAssertEqual(defaults.string(forKey: "selectedFile::" + vaultPath), fixture.fileURLs[1].standardizedFileURL.path)
+
+        // A second workspace on the same defaults restores the vault's order
+        // and, once its snapshot lands, the selected note.
+        let restoredWorkspace = try makeWorkspace(userDefaults: defaults)
+        XCTAssertTrue(restoredWorkspace.openVault(fixture.vaultURL))
+        XCTAssertEqual(restoredWorkspace.sortOrder, .byName)
+        for _ in 0..<500 where restoredWorkspace.isLoadingSnapshot {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(restoredWorkspace.isLoadingSnapshot)
+        XCTAssertEqual(
+            restoredWorkspace.selectedFileURL?.standardizedFileURL,
+            fixture.fileURLs[1].standardizedFileURL
+        )
     }
 
     func testSearchSnippetCentersOnMatch() throws {
@@ -138,7 +160,7 @@ final class SecurityAndSearchTests: XCTestCase {
 
     func testBodyResultMaterializesAndCachesSnippetOnlyOnDemand() throws {
         let fixture = try makeVault(files: [("Lazy", "# Lazy\n\nbody-only-needle")])
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
 
@@ -156,7 +178,7 @@ final class SecurityAndSearchTests: XCTestCase {
     func testExternalChangeProducesConflictInsteadOfClobbering() throws {
         let fixture = try makeVault(files: [("Note", "# Note\n\noriginal")])
         let fileURL = fixture.fileURLs[0]
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
         workspace.selectFile(fileURL)
@@ -187,7 +209,7 @@ final class SecurityAndSearchTests: XCTestCase {
     func testKeepMyVersionUsesEditsTypedDuringConflictAlert() throws {
         let fixture = try makeVault(files: [("Note", "# Note\n\noriginal")])
         let fileURL = fixture.fileURLs[0]
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
         workspace.selectFile(fileURL)
@@ -217,7 +239,7 @@ final class SecurityAndSearchTests: XCTestCase {
     func testReloadFromDiskAdoptsExternalContent() throws {
         let fixture = try makeVault(files: [("Note", "# Note\n\noriginal")])
         let fileURL = fixture.fileURLs[0]
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
         workspace.selectFile(fileURL)
@@ -246,7 +268,6 @@ final class SecurityAndSearchTests: XCTestCase {
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: vaultURL, withIntermediateDirectories: true)
         addTeardownBlock {
-            UserDefaults.standard.removeObject(forKey: "vaultBookmark")
             try? FileManager.default.removeItem(at: vaultURL)
         }
         let fileURL = vaultURL.appendingPathComponent("Latin1.md").standardizedFileURL
@@ -255,7 +276,7 @@ final class SecurityAndSearchTests: XCTestCase {
         bytes.append(0xE9)
         try Data(bytes).write(to: fileURL, options: .atomic)
 
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = vaultURL
         workspace.refreshFiles()
         workspace.selectFile(fileURL)
@@ -278,7 +299,7 @@ final class SecurityAndSearchTests: XCTestCase {
         Body without an H1.
         """
         let fixture = try makeVault(files: [("Atlas", original)])
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
 
@@ -294,7 +315,7 @@ final class SecurityAndSearchTests: XCTestCase {
         let unreadableURL = fixture.vaultURL.appendingPathComponent("Unreadable.md", isDirectory: true)
         try FileManager.default.createDirectory(at: unreadableURL, withIntermediateDirectories: false)
 
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
         XCTAssertTrue(workspace.selectFile(fixture.fileURLs[0]))
@@ -315,7 +336,7 @@ final class SecurityAndSearchTests: XCTestCase {
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: recoveryURL) }
 
-        let workspace = Workspace(recoveryStore: RecoveryStore(directoryURL: recoveryURL))
+        let workspace = try makeWorkspace(recoveryStore: RecoveryStore(directoryURL: recoveryURL))
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
         XCTAssertTrue(workspace.selectFile(fixture.fileURLs[0]))
@@ -346,7 +367,7 @@ final class SecurityAndSearchTests: XCTestCase {
         try Data("not a directory".utf8).write(to: blockedRecoveryURL)
         addTeardownBlock { try? FileManager.default.removeItem(at: blockedRecoveryURL) }
 
-        let workspace = Workspace(recoveryStore: RecoveryStore(directoryURL: blockedRecoveryURL))
+        let workspace = try makeWorkspace(recoveryStore: RecoveryStore(directoryURL: blockedRecoveryURL))
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
         XCTAssertTrue(workspace.selectFile(fixture.fileURLs[0]))
@@ -362,7 +383,7 @@ final class SecurityAndSearchTests: XCTestCase {
 
     func testExternalChangeBatchAlwaysRechecksSelectedNote() throws {
         let fixture = try makeVault(files: [("Note", "original")])
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
         XCTAssertTrue(workspace.selectFile(fixture.fileURLs[0]))
@@ -375,9 +396,9 @@ final class SecurityAndSearchTests: XCTestCase {
         XCTAssertNil(workspace.saveConflict)
     }
 
-    func testUnrelatedPresenterEventDoesNotConflictWithOrdinaryUnsavedEdits() throws {
+    func testUnrelatedPresenterEventDoesNotConflictWithOrdinaryUnsavedEdits() async throws {
         let fixture = try makeVault(files: [("Note", "original")])
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
         XCTAssertTrue(workspace.selectFile(fixture.fileURLs[0]))
@@ -390,13 +411,23 @@ final class SecurityAndSearchTests: XCTestCase {
         XCTAssertEqual(workspace.text, "local unsaved")
         XCTAssertNil(workspace.saveConflict)
         XCTAssertTrue(workspace.hasUnsavedChanges)
+
+        // The background refresh the event started must not touch the
+        // buffer either. Waiting for it also lets the workspace go away with
+        // the test instead of drafting into a removed recovery directory.
+        for _ in 0..<500 where workspace.isLoadingSnapshot {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(workspace.isLoadingSnapshot)
+        XCTAssertEqual(workspace.text, "local unsaved")
+        XCTAssertTrue(workspace.hasUnsavedChanges)
     }
 
     func testExternalMoveRemapsSelectedNoteWithoutLosingBuffer() throws {
         let fixture = try makeVault(files: [("Old", "body")])
         let oldURL = fixture.fileURLs[0]
         let newURL = fixture.vaultURL.appendingPathComponent("New.md")
-        let workspace = Workspace()
+        let workspace = try makeWorkspace()
         workspace.vaultURL = fixture.vaultURL
         workspace.refreshFiles()
         XCTAssertTrue(workspace.selectFile(oldURL))
@@ -415,14 +446,14 @@ final class SecurityAndSearchTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: recoveryURL) }
         let recoveryStore = RecoveryStore(directoryURL: recoveryURL)
 
-        let firstWorkspace = Workspace(recoveryStore: recoveryStore)
+        let firstWorkspace = try makeWorkspace(recoveryStore: recoveryStore)
         firstWorkspace.vaultURL = fixture.vaultURL
         firstWorkspace.refreshFiles()
         XCTAssertTrue(firstWorkspace.selectFile(fixture.fileURLs[0]))
         firstWorkspace.text = "locally recovered edit"
         firstWorkspace.persistRecoveryDraftNow()
 
-        let restoredWorkspace = Workspace(recoveryStore: recoveryStore)
+        let restoredWorkspace = try makeWorkspace(recoveryStore: recoveryStore)
         restoredWorkspace.vaultURL = fixture.vaultURL
         restoredWorkspace.refreshFiles()
         XCTAssertTrue(restoredWorkspace.selectFile(fixture.fileURLs[0]))
@@ -434,6 +465,115 @@ final class SecurityAndSearchTests: XCTestCase {
         )
         XCTAssertTrue(restoredWorkspace.hasUnsavedChanges)
         XCTAssertEqual(try String(contentsOf: fixture.fileURLs[0], encoding: .utf8), "base content")
+    }
+
+    func testRecoveryDraftStoresOnlyADigestOfItsBase() throws {
+        let recoveryURL = makeTemporaryDirectoryURL()
+        let store = RecoveryStore(directoryURL: recoveryURL)
+        let noteURL = URL(fileURLWithPath: "/vault/Note.md")
+
+        try store.save(content: "edited", baseContent: "base", for: noteURL)
+
+        let draftFiles = try FileManager.default.contentsOfDirectory(at: recoveryURL, includingPropertiesForKeys: nil)
+        XCTAssertEqual(draftFiles.count, 1)
+        let draftFile = try XCTUnwrap(draftFiles.first)
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: draftFile)) as? [String: Any]
+        )
+        XCTAssertNil(json["baseContent"], "Drafts must not store a second full copy of the note")
+        XCTAssertEqual(json["baseContentDigest"] as? String, RecoveryDraft.digest(of: "base"))
+        XCTAssertEqual(json["content"] as? String, "edited")
+
+        let draft = try XCTUnwrap(store.draft(for: noteURL))
+        XCTAssertTrue(draft.isBased(on: "base"))
+        XCTAssertFalse(draft.isBased(on: "base "))
+        // SHA-256 test vector, so digests stay comparable across versions.
+        XCTAssertEqual(
+            RecoveryDraft.digest(of: "abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        )
+    }
+
+    func testLegacyDraftWithFullBaseRestoresOnlyWhileDiskStillMatchesThatBase() throws {
+        let fixture = try makeVault(files: [
+            ("Matching", "matching base"),
+            ("Diverged", "changed on disk since the draft")
+        ])
+        let store = RecoveryStore(directoryURL: makeTemporaryDirectoryURL())
+        try writeLegacyDraft(content: "matching edit", baseContent: "matching base", for: fixture.fileURLs[0], in: store)
+        try writeLegacyDraft(content: "diverged edit", baseContent: "diverged base", for: fixture.fileURLs[1], in: store)
+
+        XCTAssertEqual(
+            store.draft(for: fixture.fileURLs[0])?.baseContentDigest,
+            RecoveryDraft.digest(of: "matching base")
+        )
+
+        let matchingWorkspace = try makeWorkspace(recoveryStore: store)
+        matchingWorkspace.vaultURL = fixture.vaultURL
+        matchingWorkspace.refreshFiles()
+        XCTAssertTrue(matchingWorkspace.selectFile(fixture.fileURLs[0]))
+        XCTAssertEqual(matchingWorkspace.text, "matching edit")
+        XCTAssertTrue(matchingWorkspace.hasUnsavedChanges)
+
+        let divergedWorkspace = try makeWorkspace(recoveryStore: store)
+        divergedWorkspace.vaultURL = fixture.vaultURL
+        divergedWorkspace.refreshFiles()
+        XCTAssertTrue(divergedWorkspace.selectFile(fixture.fileURLs[1]))
+        XCTAssertEqual(divergedWorkspace.text, "changed on disk since the draft")
+        XCTAssertNil(divergedWorkspace.recoveredDraftURL)
+        // The divergent draft is kept for explicit recovery.
+        XCTAssertEqual(store.draft(for: fixture.fileURLs[1])?.content, "diverged edit")
+    }
+
+    func testDeferredDraftWriteNeverLandsAfterANewerWriteOrRemoval() throws {
+        let store = RecoveryStore(directoryURL: makeTemporaryDirectoryURL())
+        let noteURL = URL(fileURLWithPath: "/vault/Note.md")
+
+        let staleTicket = store.reserveDeferredWrite(for: noteURL)
+        let newerTicket = store.reserveDeferredWrite(for: noteURL)
+        XCTAssertTrue(store.save(content: "newer", baseContent: "base", ifCurrent: newerTicket))
+        XCTAssertFalse(store.save(content: "stale", baseContent: "base", ifCurrent: staleTicket))
+        XCTAssertFalse(store.save(content: "repeat", baseContent: "base", ifCurrent: newerTicket))
+        XCTAssertEqual(store.draft(for: noteURL)?.content, "newer")
+
+        let ticketBeforeSave = store.reserveDeferredWrite(for: noteURL)
+        try store.save(content: "saved synchronously", baseContent: "base", for: noteURL)
+        XCTAssertFalse(store.save(content: "late", baseContent: "base", ifCurrent: ticketBeforeSave))
+        XCTAssertEqual(store.draft(for: noteURL)?.content, "saved synchronously")
+
+        let ticketBeforeRemoval = store.reserveDeferredWrite(for: noteURL)
+        store.removeDraft(for: noteURL)
+        XCTAssertFalse(store.save(content: "resurrected", baseContent: "base", ifCurrent: ticketBeforeRemoval))
+        XCTAssertNil(store.draft(for: noteURL))
+
+        // Tickets are per note: removing another note's draft supersedes nothing.
+        let ticketForNote = store.reserveDeferredWrite(for: noteURL)
+        store.removeDraft(for: URL(fileURLWithPath: "/vault/Other.md"))
+        XCTAssertTrue(store.save(content: "kept", baseContent: "base", ifCurrent: ticketForNote))
+        XCTAssertEqual(store.draft(for: noteURL)?.content, "kept")
+    }
+
+    func testTypingPauseWritesTheRecoveryDraftInTheBackground() async throws {
+        let fixture = try makeVault(files: [("Note", "original")])
+        let store = RecoveryStore(directoryURL: makeTemporaryDirectoryURL())
+        let workspace = try makeWorkspace(recoveryStore: store)
+        workspace.vaultURL = fixture.vaultURL
+        workspace.refreshFiles()
+        XCTAssertTrue(workspace.selectFile(fixture.fileURLs[0]))
+
+        workspace.text = "typed but unsaved"
+        // The draft is debounced and written off the main actor, never inline.
+        XCTAssertNil(store.draft(for: fixture.fileURLs[0]))
+
+        for _ in 0..<500 where store.draft(for: fixture.fileURLs[0]) == nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let draft = try XCTUnwrap(store.draft(for: fixture.fileURLs[0]))
+        XCTAssertEqual(draft.content, "typed but unsaved")
+        XCTAssertTrue(draft.isBased(on: "original"))
+
+        XCTAssertEqual(workspace.saveCurrentFile(), .saved)
+        XCTAssertNil(store.draft(for: fixture.fileURLs[0]))
     }
 
     // MARK: - Fixture
@@ -454,13 +594,78 @@ final class SecurityAndSearchTests: XCTestCase {
             return fileURL
         }
 
-        let selectedFileKey = "selectedFile::" + vaultURL.standardizedFileURL.path
         addTeardownBlock {
-            UserDefaults.standard.removeObject(forKey: "vaultBookmark")
-            UserDefaults.standard.removeObject(forKey: selectedFileKey)
             try? FileManager.default.removeItem(at: vaultURL)
         }
 
         return (vaultURL, fileURLs)
+    }
+
+    /// A workspace whose persisted state lives in a throwaway defaults suite
+    /// (and, unless given a store, a throwaway recovery directory).
+    private func makeWorkspace(
+        recoveryStore: RecoveryStore? = nil,
+        userDefaults: UserDefaults? = nil
+    ) throws -> Workspace {
+        let defaults: UserDefaults
+        if let userDefaults {
+            defaults = userDefaults
+        } else {
+            defaults = try makeUserDefaults()
+        }
+        return Workspace(
+            preferences: AppPreferences(userDefaults: defaults),
+            recoveryStore: recoveryStore ?? RecoveryStore(directoryURL: makeTemporaryDirectoryURL()),
+            userDefaults: defaults
+        )
+    }
+
+    private func makeUserDefaults() throws -> UserDefaults {
+        let suiteName = "SecurityAndSearchTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        addTeardownBlock {
+            UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName)
+        }
+        return defaults
+    }
+
+    /// A directory URL under the temporary directory, removed at teardown.
+    /// The directory itself is created lazily by whoever writes into it.
+    private func makeTemporaryDirectoryURL() -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SecurityAndSearchTests-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: url)
+        }
+        return url
+    }
+
+    /// Replaces the draft file `store` keeps for `url` with the pre-digest
+    /// format, which stored the complete base text.
+    private func writeLegacyDraft(
+        content: String,
+        baseContent: String,
+        for url: URL,
+        in store: RecoveryStore
+    ) throws {
+        let existingNames = Set(draftFileNames(in: store))
+        try store.save(content: content, baseContent: baseContent, for: url)
+        let createdName = try XCTUnwrap(draftFileNames(in: store).first { !existingNames.contains($0) })
+        let legacyDraft: [String: Any] = [
+            "sourcePath": url.standardizedFileURL.path,
+            "content": content,
+            "baseContent": baseContent,
+            "updatedAt": 0
+        ]
+        try JSONSerialization.data(withJSONObject: legacyDraft)
+            .write(to: store.directoryURL.appendingPathComponent(createdName), options: .atomic)
+    }
+
+    private func draftFileNames(in store: RecoveryStore) -> [String] {
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: store.directoryURL,
+            includingPropertiesForKeys: nil
+        )) ?? []
+        return urls.map(\.lastPathComponent)
     }
 }

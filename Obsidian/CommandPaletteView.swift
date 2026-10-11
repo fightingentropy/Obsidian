@@ -1,9 +1,5 @@
 import SwiftUI
 
-enum PaletteResult: Equatable {
-    case file(URL)
-}
-
 struct CommandPaletteView: View {
     let workspace: Workspace
     let onDismiss: () -> Void
@@ -23,11 +19,11 @@ struct CommandPaletteView: View {
     @State private var savedSearchName = ""
     @FocusState private var isSearchFieldFocused: Bool
 
-    private var primaryResult: PaletteResult? {
-        guard results.indices.contains(selectedIndex) else {
-            return results.first.map { .file($0.id) }
+    private var primaryResult: NoteSearchResult? {
+        if results.indices.contains(selectedIndex) {
+            return results[selectedIndex]
         }
-        return .file(results[selectedIndex].id)
+        return results.first
     }
 
     var body: some View {
@@ -99,7 +95,7 @@ struct CommandPaletteView: View {
                                             workspace.selectFile(match.url)
                                             dismiss()
                                         }
-                                        .id(index)
+                                        .id(match.id)
                                     }
                                 }
                             }
@@ -108,8 +104,9 @@ struct CommandPaletteView: View {
                     }
                     .frame(maxHeight: 420)
                     .onChange(of: selectedIndex) { _, newValue in
+                        guard results.indices.contains(newValue) else { return }
                         withAnimation(.easeOut(duration: 0.1)) {
-                            proxy.scrollTo(newValue, anchor: .center)
+                            proxy.scrollTo(results[newValue].id, anchor: .center)
                         }
                     }
                 }
@@ -125,10 +122,6 @@ struct CommandPaletteView: View {
             }
             .shadow(color: .black.opacity(0.2), radius: 24, y: 16)
             .padding(24)
-        }
-        .onAppear {
-            entries = workspace.makeSearchEntries()
-            results = Workspace.search(entries, query: "")
         }
         .task {
             // The palette is an overlay, so its `onAppear` can run before the
@@ -170,14 +163,29 @@ struct CommandPaletteView: View {
         }
         .task(id: searchGeneration) {
             let generation = searchGeneration
+            if generation == 0 {
+                // The palette just opened. Snapshot the corpus here, not in
+                // `onAppear`, so this task is the single producer of the
+                // opening result list instead of running the search twice.
+                entries = workspace.makeSearchEntries()
+            } else {
+                do {
+                    try await Task.sleep(for: .milliseconds(70))
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled, generation == searchGeneration else { return }
+            }
             let snapshot = entries
             let currentQuery = query
-            do {
-                try await Task.sleep(for: .milliseconds(70))
-            } catch {
+            if generation == 0, currentQuery.isEmpty {
+                // An empty query is a plain O(files) map, so produce the
+                // opening list inline rather than after a worker hop that
+                // would let an empty frame show first.
+                results = ObsidianAdvancedSearchEvaluator.search(snapshot, query: currentQuery)
+                selectedIndex = 0
                 return
             }
-            guard !Task.isCancelled, generation == searchGeneration else { return }
             let worker = Task.detached(priority: .userInitiated) {
                 ObsidianAdvancedSearchEvaluator.search(snapshot, query: currentQuery)
             }
@@ -257,13 +265,8 @@ struct CommandPaletteView: View {
     }
 
     private func activatePrimaryResult() {
-        switch primaryResult {
-        case .file(let id):
-            guard let match = results.first(where: { $0.id == id }) else { return }
-            workspace.selectFile(match.url)
-            dismiss()
-        case nil:
-            break
-        }
+        guard let match = primaryResult else { return }
+        workspace.selectFile(match.url)
+        dismiss()
     }
 }

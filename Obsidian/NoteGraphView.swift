@@ -14,12 +14,28 @@ struct NoteGraphView: View {
     @State private var isComputingLayout = false
     @State private var filter = GraphFilter()
     @State private var isFilterBarPresented = false
-    /// Topology identity of the layout most recently scheduled, used to avoid
-    /// re-running the force simulation on cosmetic (filter/selection) changes.
+    /// Everything derived from the raw graph, the active filter and the hovered
+    /// node (filtered snapshot, label set, connected nodes, ...). Rebuilt only
+    /// when one of those inputs changes — never per body evaluation or per
+    /// Canvas draw. See `refreshDerivedState`.
+    @State private var derived = GraphDerivedState()
+    /// Topology key of the layout most recently *scheduled*. Compared against
+    /// the current graph so cosmetic changes (filter text, titles) never
+    /// reschedule the simulation.
+    @State private var scheduledTopology: GraphTopologyKey?
+    /// Topology identity of the layout most recently *computed*, used to avoid
+    /// re-running the force simulation on selection-only changes. Assigned as
+    /// soon as the simulation frames exist, before they are animated in.
     @State private var laidOutTopology: GraphTopologyKey?
+    /// Final frame of the most recent force simulation. Re-centering works from
+    /// this rather than from `layout`, which may be a mid-animation frame.
+    @State private var settledLayout: NoteGraphLayout?
 
     private let minimumZoom: CGFloat = 0.65
     private let maximumZoom: CGFloat = 2.8
+    /// How far beyond the canvas an edge may still be drawn, so strokes that
+    /// run along the border are not dropped by the visibility cull.
+    private let edgeCullingMargin: CGFloat = 4
 
     private var rawSnapshot: NoteGraphSnapshot {
         workspace.noteGraph
@@ -33,96 +49,47 @@ struct NoteGraphView: View {
         rawSnapshot
     }
 
-    /// Graph snapshot with active filters applied. Edges are trimmed to only
-    /// those whose endpoints both survived the filter so orphan edges don't
-    /// get drawn.
+    /// Graph snapshot with active filters applied (memoized in `derived`).
     private var snapshot: NoteGraphSnapshot {
-        let base = rawSnapshot
-        guard !filter.isEmpty else { return base }
-
-        let searchQuery = filter.titleSearch.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        let allowedIDs = Set(base.nodes.compactMap { node -> URL? in
-            guard node.degree >= filter.minDegree else { return nil }
-
-            if !searchQuery.isEmpty,
-               !node.title.localizedStandardContains(searchQuery),
-               !node.relativePath.localizedStandardContains(searchQuery) {
-                return nil
-            }
-
-            return node.id
-        })
-
-        let filteredNodes = base.nodes.filter { allowedIDs.contains($0.id) }
-        let filteredEdges = base.edges.filter {
-            allowedIDs.contains($0.source) && allowedIDs.contains($0.target)
-        }
-        let filteredSelected = base.selectedNodeID.flatMap { allowedIDs.contains($0) ? $0 : nil }
-        let filteredConnected = base.connectedNodeIDs.intersection(allowedIDs)
-
-        return NoteGraphSnapshot(
-            nodes: filteredNodes,
-            edges: filteredEdges,
-            selectedNodeID: filteredSelected,
-            connectedNodeIDs: filteredConnected
-        )
-    }
-
-    private var visibleLabelNodeIDs: Set<URL> {
-        var ids = Set<URL>()
-
-        if let selectedNodeID = snapshot.selectedNodeID {
-            ids.insert(selectedNodeID)
-            let neighborIDs = snapshot.neighbors(of: selectedNodeID)
-                .prefix(6)
-                .map(\.id)
-            ids.formUnion(neighborIDs)
-        }
-
-        if let hoveredNodeID {
-            ids.insert(hoveredNodeID)
-        }
-
-        let prominentNodes = snapshot.nodes
-            .sorted { lhs, rhs in
-                if lhs.degree != rhs.degree {
-                    return lhs.degree > rhs.degree
-                }
-                return lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
-            }
-            .prefix(4)
-            .map(\.id)
-        ids.formUnion(prominentNodes)
-
-        return ids
+        derived.snapshot
     }
 
     private var connectedNodes: [NoteGraphNode] {
-        snapshot.neighbors(of: snapshot.selectedNodeID)
+        derived.connectedNodes
+    }
+
+    private var labeledNodes: [NoteGraphNode] {
+        derived.labeledNodes
+    }
+
+    /// Nodes exposed to assistive technology, ordered most-connected first so the
+    /// graph's hubs are encountered early during VoiceOver navigation.
+    private var accessibilityNodes: [NoteGraphNode] {
+        derived.accessibilityNodes
     }
 
     /// Identity of the inputs that actually require a fresh force layout: the raw
     /// node/edge topology, the pinned (selected) node, and the relayout seed.
     /// Filter search text and min-degree are intentionally excluded so typing in
     /// the filter does not relayout or reshuffle the graph.
-    private var layoutTopologyKey: GraphTopologyKey {
-        GraphTopologyKey(
-            nodeIDs: layoutSnapshot.nodes.map(\.id),
-            edgeIDs: layoutSnapshot.edges.map(\.id),
-            selectedNodeID: layoutSnapshot.selectedNodeID,
+    private func currentTopologyKey() -> GraphTopologyKey {
+        let graph = layoutSnapshot
+        return GraphTopologyKey(
+            nodeIDs: graph.nodes.map(\.id),
+            edgeIDs: graph.edges.map(\.id),
+            selectedNodeID: graph.selectedNodeID,
             relayoutSeed: relayoutSeed
         )
     }
 
-    /// Whether the force simulation should be skipped this scheduling pass because
-    /// only the pinned node changed and the existing positions can be re-centered.
-    private func canRecenterOnly(for key: GraphTopologyKey) -> Bool {
+    /// Whether the simulation can be skipped for `key` because the settled layout
+    /// already covers the same node/edge topology and seed. Only the pinned
+    /// (selected) node may differ, which a cheap re-centre handles.
+    private func canReuseSettledLayout(for key: GraphTopologyKey) -> Bool {
         guard let previous = laidOutTopology else { return false }
         return previous.nodeIDs == key.nodeIDs
             && previous.edgeIDs == key.edgeIDs
             && previous.relayoutSeed == key.relayoutSeed
-            && previous.selectedNodeID != key.selectedNodeID
     }
 
     var body: some View {
@@ -140,7 +107,7 @@ struct NoteGraphView: View {
 
                         graphCanvas(in: geometry.size)
 
-                        if let selectedNode = snapshot.selectedNode {
+                        if let selectedNode = derived.selectedNode {
                             selectedNodePanel(selectedNode)
                                 .padding(20)
                                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -150,7 +117,11 @@ struct NoteGraphView: View {
                             .padding(20)
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
 
-                        if snapshot.nodes.isEmpty {
+                        // With no filter the derived snapshot equals the raw one
+                        // (non-empty here), so "no matches" can only come from a
+                        // filter. Checking the filter also keeps the overlay from
+                        // flashing before `onAppear` populates `derived`.
+                        if !filter.isEmpty, snapshot.nodes.isEmpty {
                             noMatchesOverlay
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                         }
@@ -169,19 +140,51 @@ struct NoteGraphView: View {
         }
         .background(Color(nsColor: .textBackgroundColor))
         .onAppear {
-            scheduleLayout()
+            refreshDerivedState()
+            let key = currentTopologyKey()
+            scheduledTopology = key
+            scheduleLayout(for: key)
         }
         .onDisappear {
             layoutTask?.cancel()
         }
-        .onChange(of: layoutTopologyKey) { _, _ in
-            scheduleLayout()
+        .onChange(of: workspace.noteGraph) { _, _ in
+            refreshDerivedState()
+            scheduleLayoutIfTopologyChanged()
         }
-        .onChange(of: snapshot.selectedNodeID) { oldValue, newValue in
+        .onChange(of: filter) { _, _ in
+            refreshDerivedState()
+        }
+        .onChange(of: hoveredNodeID) { _, newValue in
+            // Hover only changes which extra label is shown; it never re-filters.
+            derived.updateLabels(hoveredNodeID: newValue)
+        }
+        .onChange(of: relayoutSeed) { _, _ in
+            scheduleLayoutIfTopologyChanged()
+        }
+        .onChange(of: derived.snapshot.selectedNodeID) { oldValue, newValue in
             if oldValue != newValue {
                 resetViewport()
             }
         }
+    }
+
+    /// Rebuilds everything that depends on the raw graph, the filter or the
+    /// hovered node. Called from `onAppear` and from the graph/filter `onChange`
+    /// handlers only.
+    private func refreshDerivedState() {
+        derived = GraphDerivedState(
+            graph: rawSnapshot,
+            filter: filter,
+            hoveredNodeID: hoveredNodeID
+        )
+    }
+
+    private func scheduleLayoutIfTopologyChanged() {
+        let key = currentTopologyKey()
+        guard key != scheduledTopology else { return }
+        scheduledTopology = key
+        scheduleLayout(for: key)
     }
 
     private var noMatchesOverlay: some View {
@@ -284,25 +287,9 @@ struct NoteGraphView: View {
         }
     }
 
-    /// Nodes exposed to assistive technology, ordered most-connected first so the
-    /// graph's hubs are encountered early during VoiceOver navigation.
-    private var accessibilityNodes: [NoteGraphNode] {
-        snapshot.nodes.sorted { lhs, rhs in
-            if lhs.degree != rhs.degree {
-                return lhs.degree > rhs.degree
-            }
-            return lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
-        }
-    }
-
     private func connectionDescription(for node: NoteGraphNode) -> String {
         let count = node.degree
         return count == 1 ? "1 connection" : "\(count) connections"
-    }
-
-    private var labeledNodes: [NoteGraphNode] {
-        let ids = visibleLabelNodeIDs
-        return snapshot.nodes.filter { ids.contains($0.id) }
     }
 
     private func handleNodeTap(at location: CGPoint, in size: CGSize) {
@@ -318,16 +305,19 @@ struct NoteGraphView: View {
     /// order. Ties are broken toward larger (higher-degree) nodes.
     private func nearestNode(to location: CGPoint, in size: CGSize) -> NoteGraphNode? {
         let minimumTapRadius: CGFloat = 12
+        let selectedNodeID = snapshot.selectedNodeID
+        let positions = layout.positions
         var best: (node: NoteGraphNode, distanceSquared: CGFloat, degree: Int)?
 
         for node in snapshot.nodes {
-            guard let position = layout.positions[node.id] else { continue }
+            guard let position = positions[node.id] else { continue }
             let screenPos = transformed(position, in: size)
             let dx = location.x - screenPos.x
             let dy = location.y - screenPos.y
             let distanceSquared = dx * dx + dy * dy
 
-            let hitRadius = max(nodeDiameter(for: node) / 2, minimumTapRadius)
+            let diameter = Self.nodeDiameter(for: node, isSelected: node.id == selectedNodeID)
+            let hitRadius = max(diameter / 2, minimumTapRadius)
             guard distanceSquared <= hitRadius * hitRadius else { continue }
 
             if let current = best {
@@ -343,37 +333,90 @@ struct NoteGraphView: View {
     }
 
     private func drawEdges(in context: inout GraphicsContext, size: CGSize) {
+        let selectedNodeID = snapshot.selectedNodeID
+        let hoveredNodeID = hoveredNodeID
+        let positions = layout.positions
+        let visibleRect = CGRect(origin: .zero, size: size)
+            .insetBy(dx: -edgeCullingMargin, dy: -edgeCullingMargin)
+
+        // Edges are batched into (at most) three paths by emphasis so the canvas
+        // issues three strokes instead of one per edge.
+        var selectedEdges = Path()
+        var hoveredEdges = Path()
+        var normalEdges = Path()
+
         for edge in snapshot.edges {
-            guard let source = layout.positions[edge.source],
-                  let target = layout.positions[edge.target] else {
+            guard let source = positions[edge.source],
+                  let target = positions[edge.target] else {
                 continue
             }
 
             let sourcePoint = transformed(source, in: size)
             let targetPoint = transformed(target, in: size)
-            var path = Path()
-            path.move(to: sourcePoint)
-            path.addLine(to: targetPoint)
+            guard Self.segmentMayIntersect(visibleRect, from: sourcePoint, to: targetPoint) else {
+                continue
+            }
+
+            if edge.source == selectedNodeID || edge.target == selectedNodeID {
+                selectedEdges.move(to: sourcePoint)
+                selectedEdges.addLine(to: targetPoint)
+            } else if edge.source == hoveredNodeID || edge.target == hoveredNodeID {
+                hoveredEdges.move(to: sourcePoint)
+                hoveredEdges.addLine(to: targetPoint)
+            } else {
+                normalEdges.move(to: sourcePoint)
+                normalEdges.addLine(to: targetPoint)
+            }
+        }
+
+        // Plain edges first so the highlighted ones stay on top.
+        if !normalEdges.isEmpty {
             context.stroke(
-                path,
-                with: .color(edgeColor(for: edge)),
-                style: StrokeStyle(lineWidth: edgeWidth(for: edge), lineCap: .round)
+                normalEdges,
+                with: .color(Color.primary.opacity(0.075)),
+                style: StrokeStyle(lineWidth: 0.65, lineCap: .round)
+            )
+        }
+
+        if !hoveredEdges.isEmpty {
+            context.stroke(
+                hoveredEdges,
+                with: .color(Color.primary.opacity(0.22)),
+                style: StrokeStyle(lineWidth: 0.65, lineCap: .round)
+            )
+        }
+
+        if !selectedEdges.isEmpty {
+            context.stroke(
+                selectedEdges,
+                with: .color(Color.primary.opacity(0.28)),
+                style: StrokeStyle(lineWidth: 1.2, lineCap: .round)
             )
         }
     }
 
     private func drawNodes(in context: inout GraphicsContext, size: CGSize) {
+        let selectedNodeID = snapshot.selectedNodeID
+        let connectedNodeIDs = snapshot.connectedNodeIDs
+        let hoveredNodeID = hoveredNodeID
+        let positions = layout.positions
+        let visibleRect = CGRect(origin: .zero, size: size)
+
         for node in snapshot.nodes {
-            guard let position = layout.positions[node.id] else { continue }
+            guard let position = positions[node.id] else { continue }
+            let isSelected = node.id == selectedNodeID
+            let isHovered = node.id == hoveredNodeID
             let screenPos = transformed(position, in: size)
-            let diameter = nodeDiameter(for: node)
-            let isSelected = snapshot.selectedNodeID == node.id
+            let diameter = Self.nodeDiameter(for: node, isSelected: isSelected)
             let rect = CGRect(
                 x: screenPos.x - diameter / 2,
                 y: screenPos.y - diameter / 2,
                 width: diameter,
                 height: diameter
             )
+
+            // The focus ring is the widest decoration; anything beyond it is off-canvas.
+            guard rect.insetBy(dx: -6, dy: -6).intersects(visibleRect) else { continue }
 
             if isSelected {
                 let focusRing = rect.insetBy(dx: -5, dy: -5)
@@ -384,10 +427,15 @@ struct NoteGraphView: View {
                 )
             }
 
-            context.fill(Circle().path(in: rect), with: .color(nodeFill(for: node)))
+            let fill = Self.nodeFill(
+                isSelected: isSelected,
+                isHovered: isHovered,
+                isConnected: connectedNodeIDs.contains(node.id)
+            )
+            context.fill(Circle().path(in: rect), with: .color(fill))
             context.stroke(
                 Circle().path(in: rect),
-                with: .color(nodeStroke(for: node)),
+                with: .color(Self.nodeStroke(isHighlighted: isSelected || isHovered)),
                 style: StrokeStyle(lineWidth: isSelected ? 1.5 : 0.8)
             )
         }
@@ -395,7 +443,7 @@ struct NoteGraphView: View {
 
     private func nodeLabel(_ node: NoteGraphNode, position: CGPoint) -> some View {
         let isSelected = snapshot.selectedNodeID == node.id
-        let size = nodeDiameter(for: node)
+        let size = Self.nodeDiameter(for: node, isSelected: isSelected)
 
         return Text(node.title)
             .font(isSelected ? .callout.weight(.semibold) : .caption2.weight(.medium))
@@ -471,8 +519,8 @@ struct NoteGraphView: View {
                 }
 
                 graphControlButton(systemImage: "arrow.clockwise", help: "Relayout Graph") {
-                    // Bumping the seed changes `layoutTopologyKey`, which triggers
-                    // `scheduleLayout()` via `onChange`.
+                    // Bumping the seed changes the topology key, which schedules
+                    // a fresh simulation via `onChange(of: relayoutSeed)`.
                     relayoutSeed += 1
                 }
 
@@ -653,54 +701,61 @@ struct NoteGraphView: View {
         .help(help)
     }
 
-    private func nodeDiameter(for node: NoteGraphNode) -> CGFloat {
+    nonisolated private static func nodeDiameter(for node: NoteGraphNode, isSelected: Bool) -> CGFloat {
         let clampedDegree = CGFloat(min(max(node.degree, 0), 12))
-        let selectionBoost: CGFloat = snapshot.selectedNodeID == node.id ? 4 : 0
+        let selectionBoost: CGFloat = isSelected ? 4 : 0
         return 7 + sqrt(clampedDegree) * 2 + selectionBoost
     }
 
-    private func nodeFill(for node: NoteGraphNode) -> Color {
-        if snapshot.selectedNodeID == node.id {
+    private static func nodeFill(isSelected: Bool, isHovered: Bool, isConnected: Bool) -> Color {
+        if isSelected {
             return Color.primary.opacity(0.92)
         }
 
-        if hoveredNodeID == node.id {
+        if isHovered {
             return Color.primary.opacity(0.78)
         }
 
-        if snapshot.connectedNodeIDs.contains(node.id) {
+        if isConnected {
             return Color.primary.opacity(0.52)
         }
 
         return Color.primary.opacity(0.23)
     }
 
-    private func nodeStroke(for node: NoteGraphNode) -> Color {
-        if snapshot.selectedNodeID == node.id || hoveredNodeID == node.id {
+    private static func nodeStroke(isHighlighted: Bool) -> Color {
+        if isHighlighted {
             return Color(nsColor: .textBackgroundColor).opacity(0.88)
         }
 
         return Color.primary.opacity(0.2)
     }
 
-    private func edgeColor(for edge: NoteGraphEdge) -> Color {
-        if edge.source == snapshot.selectedNodeID || edge.target == snapshot.selectedNodeID {
-            return Color.primary.opacity(0.28)
-        }
-
-        if edge.source == hoveredNodeID || edge.target == hoveredNodeID {
-            return Color.primary.opacity(0.22)
-        }
-
-        return Color.primary.opacity(0.075)
+    /// Conservative visibility test for an edge (Cohen–Sutherland trivial reject):
+    /// a segment is skipped only when both endpoints lie beyond the *same* side
+    /// of `rect`, which guarantees it cannot cross the visible area. Segments
+    /// whose endpoints are outside on different sides are kept, since they may
+    /// still pass through the canvas when zoomed in.
+    nonisolated private static func segmentMayIntersect(_ rect: CGRect, from start: CGPoint, to end: CGPoint) -> Bool {
+        (outcode(of: start, in: rect) & outcode(of: end, in: rect)) == 0
     }
 
-    private func edgeWidth(for edge: NoteGraphEdge) -> CGFloat {
-        if edge.source == snapshot.selectedNodeID || edge.target == snapshot.selectedNodeID {
-            return 1.2
+    nonisolated private static func outcode(of point: CGPoint, in rect: CGRect) -> UInt8 {
+        var code: UInt8 = 0
+
+        if point.x < rect.minX {
+            code |= 1
+        } else if point.x > rect.maxX {
+            code |= 2
         }
 
-        return 0.65
+        if point.y < rect.minY {
+            code |= 4
+        } else if point.y > rect.maxY {
+            code |= 8
+        }
+
+        return code
     }
 
     private func transformed(_ point: CGPoint, in size: CGSize) -> CGPoint {
@@ -718,24 +773,30 @@ struct NoteGraphView: View {
         viewport.commitZoom()
     }
 
-    private func scheduleLayout() {
+    private func scheduleLayout(for key: GraphTopologyKey) {
         let snapshot = layoutSnapshot
-        let key = layoutTopologyKey
         layoutTask?.cancel()
 
         guard !snapshot.nodes.isEmpty else {
             layout = .empty
+            settledLayout = nil
             laidOutTopology = key
             isComputingLayout = false
             return
         }
 
-        // When only the pinned node changed, re-center the existing positions
+        // When the node/edge topology is unchanged (only the pinned node moved,
+        // or the view reappeared), re-center the settled simulation result
         // instead of re-running the O(n²) simulation. This keeps node positions
-        // stable (no reshuffle) and avoids a CPU spike on rapid selection changes.
-        if canRecenterOnly(for: key),
-           let recentered = NoteGraphLayoutEngine.recenter(layout, for: snapshot) {
-            withAnimation(layoutAnimation) {
+        // stable (no reshuffle) and avoids a CPU spike on rapid selection
+        // changes. Because the running animation task was cancelled above and
+        // `settledLayout` is always the simulation's *final* frame, this also
+        // works while the previous layout is still animating in.
+        if canReuseSettledLayout(for: key),
+           let settledLayout,
+           let recentered = NoteGraphLayoutEngine.recenter(settledLayout, for: snapshot) {
+            let selectionChanged = laidOutTopology?.selectedNodeID != key.selectedNodeID
+            withAnimation(selectionChanged ? layoutAnimation : nil) {
                 layout = recentered
             }
             laidOutTopology = key
@@ -744,7 +805,7 @@ struct NoteGraphView: View {
         }
 
         isComputingLayout = true
-        let seed = relayoutSeed
+        let seed = key.relayoutSeed
         let shouldAnimateSimulation = !reduceMotion
         layoutTask = Task {
             let frames = await Task.detached(priority: .userInitiated) {
@@ -752,6 +813,21 @@ struct NoteGraphView: View {
             }.value
 
             guard !Task.isCancelled else { return }
+
+            guard let finalFrame = frames.last else {
+                await MainActor.run {
+                    isComputingLayout = false
+                }
+                return
+            }
+
+            // Record the result before animating it in, so a selection change
+            // during the animation re-centers from the settled frame instead of
+            // starting a second full simulation.
+            await MainActor.run {
+                laidOutTopology = key
+                settledLayout = finalFrame
+            }
 
             if shouldAnimateSimulation, let firstFrame = frames.first {
                 await MainActor.run {
@@ -769,14 +845,13 @@ struct NoteGraphView: View {
                         layout = frame
                     }
                 }
-            } else if let finalFrame = frames.last {
+            } else {
                 await MainActor.run {
                     layout = finalFrame
                 }
             }
 
             await MainActor.run {
-                laidOutTopology = key
                 isComputingLayout = false
             }
         }
@@ -831,9 +906,109 @@ struct GraphFilter: Equatable {
     }
 }
 
+/// State derived from the raw graph, the active filter and the hovered node.
+///
+/// Everything here used to be a computed property re-evaluated on every body
+/// evaluation and inside the Canvas draw loops; it is now rebuilt only when one
+/// of its inputs changes (see `NoteGraphView.refreshDerivedState`).
+private struct GraphDerivedState {
+    /// Graph snapshot with active filters applied. Edges are trimmed to only
+    /// those whose endpoints both survived the filter so orphan edges don't
+    /// get drawn.
+    var snapshot: NoteGraphSnapshot = .empty
+    /// The selected node, if it survived the filter.
+    var selectedNode: NoteGraphNode?
+    /// Neighbours of the selected node, most connected first.
+    var connectedNodes: [NoteGraphNode] = []
+    /// Nodes exposed to assistive technology, most connected first.
+    var accessibilityNodes: [NoteGraphNode] = []
+    /// Nodes whose labels are always shown: the selection, its closest
+    /// neighbours and the graph's biggest hubs (snapshot order).
+    var prominentLabeledNodes: [NoteGraphNode] = []
+    /// `prominentLabeledNodes` plus the hovered node, if any.
+    var labeledNodes: [NoteGraphNode] = []
+
+    private var prominentLabelNodeIDs: Set<URL> = []
+    private var nodesByID: [URL: NoteGraphNode] = [:]
+
+    init() {}
+
+    init(graph: NoteGraphSnapshot, filter: GraphFilter, hoveredNodeID: URL?) {
+        snapshot = Self.filteredSnapshot(graph, filter: filter)
+        nodesByID = Dictionary(snapshot.nodes.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        selectedNode = snapshot.selectedNodeID.flatMap { nodesByID[$0] }
+        connectedNodes = snapshot.neighbors(of: snapshot.selectedNodeID)
+        accessibilityNodes = snapshot.nodes.sorted(by: Self.isMoreProminent)
+
+        var prominentIDs = Set<URL>()
+        if let selectedNodeID = snapshot.selectedNodeID {
+            prominentIDs.insert(selectedNodeID)
+            prominentIDs.formUnion(connectedNodes.prefix(6).map(\.id))
+        }
+        prominentIDs.formUnion(accessibilityNodes.prefix(4).map(\.id))
+        prominentLabelNodeIDs = prominentIDs
+        prominentLabeledNodes = snapshot.nodes.filter { prominentIDs.contains($0.id) }
+
+        updateLabels(hoveredNodeID: hoveredNodeID)
+    }
+
+    /// Hover only adds (at most) one label on top of the prominent set; it never
+    /// re-filters the graph or re-sorts the nodes.
+    mutating func updateLabels(hoveredNodeID: URL?) {
+        var nodes = prominentLabeledNodes
+        if let hoveredNodeID,
+           !prominentLabelNodeIDs.contains(hoveredNodeID),
+           let hoveredNode = nodesByID[hoveredNodeID] {
+            nodes.append(hoveredNode)
+        }
+        labeledNodes = nodes
+    }
+
+    private static func filteredSnapshot(_ base: NoteGraphSnapshot, filter: GraphFilter) -> NoteGraphSnapshot {
+        guard !filter.isEmpty else { return base }
+
+        let searchQuery = filter.titleSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let allowedIDs = Set(base.nodes.compactMap { node -> URL? in
+            guard node.degree >= filter.minDegree else { return nil }
+
+            if !searchQuery.isEmpty,
+               !node.title.localizedStandardContains(searchQuery),
+               !node.relativePath.localizedStandardContains(searchQuery) {
+                return nil
+            }
+
+            return node.id
+        })
+
+        let filteredNodes = base.nodes.filter { allowedIDs.contains($0.id) }
+        let filteredEdges = base.edges.filter {
+            allowedIDs.contains($0.source) && allowedIDs.contains($0.target)
+        }
+        let filteredSelected = base.selectedNodeID.flatMap { allowedIDs.contains($0) ? $0 : nil }
+        let filteredConnected = base.connectedNodeIDs.intersection(allowedIDs)
+
+        return NoteGraphSnapshot(
+            nodes: filteredNodes,
+            edges: filteredEdges,
+            selectedNodeID: filteredSelected,
+            connectedNodeIDs: filteredConnected
+        )
+    }
+
+    /// Degree descending, then title — shared by the accessibility ordering and
+    /// the "most prominent" label picks.
+    private static func isMoreProminent(_ lhs: NoteGraphNode, _ rhs: NoteGraphNode) -> Bool {
+        if lhs.degree != rhs.degree {
+            return lhs.degree > rhs.degree
+        }
+        return lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
+    }
+}
+
 /// Identity of the inputs that require a fresh force layout. Equatable so the
-/// view can drive `scheduleLayout` from a single `onChange` and skip relayout
-/// when only cosmetic filter state changed.
+/// view can compare the current graph against the last scheduled layout and
+/// skip relayout when only cosmetic filter state changed.
 private struct GraphTopologyKey: Equatable {
     let nodeIDs: [URL]
     let edgeIDs: [String]

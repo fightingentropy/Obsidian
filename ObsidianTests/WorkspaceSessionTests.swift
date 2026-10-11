@@ -79,7 +79,7 @@ final class WorkspaceSessionTests: XCTestCase {
         let note = vault.appendingPathComponent("Only.md")
         try "# Only\n\nBody".write(to: note, atomically: true, encoding: .utf8)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace(userDefaults: defaults)
         workspace.vaultURL = vault
         workspace.refreshFiles()
         XCTAssertTrue(workspace.selectFile(note))
@@ -105,7 +105,7 @@ final class WorkspaceSessionTests: XCTestCase {
         let note = vault.appendingPathComponent("Only.md")
         try "original".write(to: note, atomically: true, encoding: .utf8)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace(userDefaults: defaults)
         workspace.vaultURL = vault
         workspace.refreshFiles()
         XCTAssertTrue(workspace.selectFile(note))
@@ -131,6 +131,21 @@ final class WorkspaceSessionTests: XCTestCase {
                 isImage: true
             ),
             .preview
+        )
+    }
+
+    /// A workspace on the test's own defaults suite, with recovery drafts in a
+    /// throwaway directory rather than the app's Application Support folder.
+    private func makeWorkspace(userDefaults: UserDefaults) -> Workspace {
+        let recoveryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WorkspaceSessionTests-Recovery-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: recoveryURL)
+        }
+        return Workspace(
+            preferences: AppPreferences(userDefaults: userDefaults),
+            recoveryStore: RecoveryStore(directoryURL: recoveryURL),
+            userDefaults: userDefaults
         )
     }
 }

@@ -17,9 +17,44 @@ struct NoteInspectorView: View {
     @State private var draftAliases = ""
     @State private var newPropertyKey = ""
     @State private var newPropertyValue = ""
+    // Parsed once per (debounced) text change instead of on every access
+    // during a render. Selection changes and property writes refresh it
+    // synchronously so the outline and the property editor never show the
+    // previous note or a pre-edit value.
+    @State private var metadata = ObsidianMetadataParser.parse("")
+    @State private var metadataRevision: UInt64 = 0
+    // Scanning every note body is O(vault), so it runs off the main actor and
+    // only when the inputs that can change the answer do.
+    @State private var unlinkedMentions: [UnlinkedMention] = []
+    // The note `unlinkedMentions` was computed for. A list for any other
+    // note is never shown or acted on, so a selection change cannot expose
+    // mentions (or their cached bodies) of the previous scan.
+    @State private var unlinkedMentionsTarget: URL?
 
-    private var metadata: ObsidianDocumentMetadata {
-        ObsidianMetadataParser.parse(workspace.text)
+    private struct MentionsKey: Equatable {
+        let selectedFileURL: URL?
+        let title: String?
+        let aliases: [String]
+        let revision: UInt64
+    }
+
+    private var mentionsKey: MentionsKey {
+        MentionsKey(
+            selectedFileURL: workspace.selectedFileURL,
+            title: metadata.title,
+            aliases: metadata.aliases,
+            revision: workspace.searchIndexRevision
+        )
+    }
+
+    /// Nil while another tab is showing, so the vault scan only runs (and
+    /// restarts on edits) when its result is visible.
+    private var activeMentionsKey: MentionsKey? {
+        section == .links ? mentionsKey : nil
+    }
+
+    private var currentUnlinkedMentions: [UnlinkedMention] {
+        unlinkedMentionsTarget == workspace.selectedFileURL ? unlinkedMentions : []
     }
 
     var body: some View {
@@ -46,6 +81,14 @@ struct NoteInspectorView: View {
         .frame(minWidth: 270, idealWidth: 320)
         .onAppear { synchronizePropertyDrafts() }
         .onChange(of: workspace.selectedFileURL) { _, _ in synchronizePropertyDrafts() }
+        .onChange(of: workspace.text) { _, _ in metadataRevision &+= 1 }
+        .task(id: metadataRevision) {
+            await refreshMetadataAfterDebounce()
+        }
+        .task(id: activeMentionsKey) {
+            guard activeMentionsKey != nil else { return }
+            await refreshUnlinkedMentions()
+        }
     }
 
     private var outlineView: some View {
@@ -96,11 +139,12 @@ struct NoteInspectorView: View {
                 }
 
                 inspectorSection("Unlinked mentions") {
-                    if unlinkedMentions.isEmpty {
+                    let mentions = currentUnlinkedMentions
+                    if mentions.isEmpty {
                         Text("No unlinked mentions")
                             .foregroundStyle(.secondary)
                     } else {
-                        ForEach(unlinkedMentions) { mention in
+                        ForEach(mentions) { mention in
                             VStack(alignment: .leading, spacing: 6) {
                                 Button(mention.sourceTitle) {
                                     workspace.selectFile(mention.sourceURL)
@@ -210,18 +254,83 @@ struct NoteInspectorView: View {
         }
     }
 
-    private var unlinkedMentions: [UnlinkedMention] {
-        guard let selectedURL = workspace.selectedFileURL else { return [] }
+    /// Re-parses the note roughly 150 ms after the last keystroke. Revision 0
+    /// is the initial appearance, which `synchronizePropertyDrafts()` already
+    /// parsed synchronously.
+    private func refreshMetadataAfterDebounce() async {
+        guard metadataRevision > 0 else { return }
+        do {
+            try await Task.sleep(for: .milliseconds(150))
+        } catch {
+            return
+        }
+        guard !Task.isCancelled else { return }
+        let text = workspace.text
+        let parsed = await Task.detached(priority: .userInitiated) {
+            ObsidianMetadataParser.parse(text)
+        }.value
+        guard !Task.isCancelled else { return }
+        metadata = parsed
+    }
+
+    /// Snapshots the note bodies on the main actor, then scans them off it.
+    private func refreshUnlinkedMentions() async {
+        guard let selectedURL = workspace.selectedFileURL else {
+            unlinkedMentions = []
+            unlinkedMentionsTarget = nil
+            return
+        }
+        if unlinkedMentionsTarget != selectedURL {
+            unlinkedMentions = []
+            unlinkedMentionsTarget = nil
+        }
         let names = [workspace.selectedFileName, metadata.title].compactMap { $0 } + metadata.aliases
         let sources = workspace.files.compactMap { file -> (url: URL, title: String, body: String)? in
             guard let body = workspace.noteBody(for: file.url) else { return nil }
             return (file.url, workspace.title(for: file), body)
         }
-        return UnlinkedMentionFinder.find(
-            targetNames: names,
-            sources: sources,
-            excluding: selectedURL
-        )
+        // `Task.detached` does not inherit cancellation, so forward it and
+        // let the scan stop between chunks of sources.
+        let scan = Task.detached(priority: .utility) {
+            Self.scanMentions(names: names, sources: sources, excluding: selectedURL)
+        }
+        let mentions = await withTaskCancellationHandler {
+            await scan.value
+        } onCancel: {
+            scan.cancel()
+        }
+        guard !Task.isCancelled else { return }
+        unlinkedMentions = mentions
+        unlinkedMentionsTarget = selectedURL
+    }
+
+    /// Runs `UnlinkedMentionFinder` over chunks of sources, checking for
+    /// cancellation between chunks, and merges the results in the finder's
+    /// own order. Returns an empty list when cancelled.
+    nonisolated private static func scanMentions(
+        names: [String],
+        sources: [(url: URL, title: String, body: String)],
+        excluding targetURL: URL
+    ) -> [UnlinkedMention] {
+        var merged: [UnlinkedMention] = []
+        var start = 0
+        let chunkSize = 64
+        while start < sources.count {
+            if Task.isCancelled { return [] }
+            let end = min(start + chunkSize, sources.count)
+            merged += UnlinkedMentionFinder.find(
+                targetNames: names,
+                sources: Array(sources[start..<end]),
+                excluding: targetURL
+            )
+            start = end
+        }
+        return merged.sorted {
+            if $0.sourceTitle != $1.sourceTitle {
+                return $0.sourceTitle.localizedCaseInsensitiveCompare($1.sourceTitle) == .orderedAscending
+            }
+            return $0.range.location < $1.range.location
+        }
     }
 
     private var flattenedOutline: [OutlineItem] {
@@ -234,13 +343,19 @@ struct NoteInspectorView: View {
     }
 
     private func link(_ mention: UnlinkedMention) {
-        guard let replacement = UnlinkedMentionFinder.replacingMention(mention, in: mention.expectedBody) else {
-            NSSound.beep()
+        if workspace.selectedFileURL?.standardizedFileURL == mention.sourceURL.standardizedFileURL {
+            // The open note's live buffer may have diverged from the scanned
+            // body (edits, a restored draft); refuse rather than overwrite it.
+            guard let replacement = UnlinkedMentionFinder.replacingMention(mention, in: workspace.text) else {
+                NSSound.beep()
+                return
+            }
+            workspace.text = replacement
             return
         }
 
-        if workspace.selectedFileURL?.standardizedFileURL == mention.sourceURL.standardizedFileURL {
-            workspace.text = replacement
+        guard let replacement = UnlinkedMentionFinder.replacingMention(mention, in: mention.expectedBody) else {
+            NSSound.beep()
             return
         }
 
@@ -267,8 +382,13 @@ struct NoteInspectorView: View {
         }
     }
 
+    private func refreshMetadata() {
+        metadata = ObsidianMetadataParser.parse(workspace.text)
+    }
+
     private func synchronizePropertyDrafts() {
         let current = ObsidianMetadataParser.parse(workspace.text)
+        metadata = current
         draftTitle = current.title ?? ""
         draftTags = current.frontmatterTags.joined(separator: ", ")
         draftAliases = current.aliases.joined(separator: ", ")
@@ -302,6 +422,7 @@ struct NoteInspectorView: View {
                 value: value,
                 in: workspace.text
             )
+            refreshMetadata()
         } catch {
             NSSound.beep()
         }

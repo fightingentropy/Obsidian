@@ -13,11 +13,20 @@ enum ObsidianPropertyEditorError: LocalizedError {
 }
 
 enum ObsidianPropertyEditor {
+    private static let byteOrderMark: Character = "\u{feff}"
+
     static func setting(
         key: String,
         value: ObsidianPropertyValue?,
         in markdown: String
     ) throws -> String {
+        // The parser tolerates a leading BOM but reports it as part of the
+        // frontmatter block. Edit the note without it and put it back after.
+        if markdown.first == byteOrderMark {
+            let edited = try setting(key: key, value: value, in: String(markdown.dropFirst()))
+            return String(byteOrderMark) + edited
+        }
+
         let cleanKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard cleanKey.range(of: #"^[A-Za-z0-9_-]+$"#, options: .regularExpression) != nil else {
             throw ObsidianPropertyEditorError.invalidKey
@@ -43,6 +52,7 @@ enum ObsidianPropertyEditor {
         for index in 1..<closingIndex {
             let line = lines[index]
             guard line.first?.isWhitespace != true,
+                  !isListItem(line),
                   let colon = line.firstIndex(of: ":") else { continue }
             let existingKey = line[..<colon].trimmingCharacters(in: .whitespaces)
             if existingKey.caseInsensitiveCompare(cleanKey) == .orderedSame {
@@ -57,6 +67,7 @@ enum ObsidianPropertyEditor {
                 let line = lines[propertyEnd]
                 if line.first?.isWhitespace != true,
                    line.first != "#",
+                   !isListItem(line),
                    line.contains(":") {
                     break
                 }
@@ -75,6 +86,13 @@ enum ObsidianPropertyEditor {
         return updated
     }
 
+    /// Block-sequence items (`- url: a`) belong to the key above them even at
+    /// column 0, so they must not be mistaken for the next top-level key.
+    private static func isListItem(_ line: String) -> Bool {
+        let unindented = line.drop(while: { $0 == " " || $0 == "\t" })
+        return unindented == "-" || unindented.hasPrefix("- ")
+    }
+
     private static func encoded(_ value: ObsidianPropertyValue) throws -> String {
         switch value {
         case .string(let value):
@@ -84,12 +102,21 @@ enum ObsidianPropertyEditor {
         case .boolean(let value):
             return value ? "true" : "false"
         case .number(let value):
-            return String(value)
+            return formatted(value)
         case .null:
             return "null"
         case .raw:
             throw ObsidianPropertyEditorError.rawValueNotEditable
         }
+    }
+
+    /// Writes integral values without a fractional part so `3` round-trips as
+    /// `3` rather than `3.0`.
+    private static func formatted(_ value: Double) -> String {
+        if value.isFinite, value == value.rounded(), abs(value) < 1e15 {
+            return String(Int64(value))
+        }
+        return String(value)
     }
 
     private static func quote(_ value: String) -> String {

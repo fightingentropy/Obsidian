@@ -42,10 +42,14 @@ enum VaultLinkRefactor {
                 newRoot: newRoot,
                 sourceIsDirectory: sourceIsDirectory
             ) ?? note.url
-            let wikiUpdated = rewriteWikiLinks(
+            // Mask fenced and inline code once per note. Both scans search the
+            // masked text and read their targets back from the original body,
+            // so every replacement range refers to `note.body`.
+            let searchable = MarkdownNoteLinkExtractor.maskingCodeRegions(note.body)
+            let wikiReplacements = wikiLinkReplacements(
                 in: note.body,
+                searchable: searchable,
                 sourceURL: note.url,
-                destinationSourceURL: destinationURL,
                 resolvableURLs: resolvableURLs,
                 nameLookup: nameLookup,
                 oldRoot: oldRoot,
@@ -53,14 +57,20 @@ enum VaultLinkRefactor {
                 sourceIsDirectory: sourceIsDirectory,
                 vaultURL: vaultURL
             )
-            let fullyUpdated = rewriteMarkdownLinks(
-                in: wikiUpdated,
+            // The wiki pass used to run first and the Markdown pass on its
+            // output, so an overlapping range is resolved in the wiki pass's favor.
+            let markdownReplacements = markdownLinkReplacements(
+                in: note.body,
+                searchable: searchable,
                 sourceURL: note.url,
                 destinationSourceURL: destinationURL,
                 oldRoot: oldRoot,
                 newRoot: newRoot,
                 sourceIsDirectory: sourceIsDirectory
-            )
+            ).filter { candidate in
+                !wikiReplacements.contains { NSIntersectionRange($0.0, candidate.0).length > 0 }
+            }
+            let fullyUpdated = replacing(note.body, replacements: wikiReplacements + markdownReplacements)
 
             guard fullyUpdated != note.body else { return nil }
             return VaultLinkRefactorEdit(
@@ -147,23 +157,29 @@ enum VaultLinkRefactor {
         return try accessorResult.get()
     }
 
-    private static func rewriteWikiLinks(
+    private static let wikiLinkRegex = try! NSRegularExpression(pattern: #"!?\[\[([^\]|#]+)"#)
+    private static let markdownLinkRegex = try! NSRegularExpression(
+        pattern: #"!?\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)"#
+    )
+
+    /// Replacement ranges for wiki links in `body`. `searchable` is the
+    /// code-masked copy of `body`, so its match ranges index `body` directly.
+    private static func wikiLinkReplacements(
         in body: String,
+        searchable: String,
         sourceURL: URL,
-        destinationSourceURL: URL,
         resolvableURLs: Set<URL>,
         nameLookup: [String: Set<URL>],
         oldRoot: URL,
         newRoot: URL,
         sourceIsDirectory: Bool,
         vaultURL: URL
-    ) -> String {
-        guard let regex = try? NSRegularExpression(pattern: #"!?\[\[([^\]|#]+)"#) else { return body }
-        let searchable = MarkdownNoteLinkExtractor.maskingCodeRegions(body)
+    ) -> [(NSRange, String)] {
         let nsBody = body as NSString
+        let searchRange = NSRange(location: 0, length: (searchable as NSString).length)
         var replacements: [(NSRange, String)] = []
 
-        for match in regex.matches(in: searchable, range: NSRange(location: 0, length: (searchable as NSString).length)) {
+        for match in wikiLinkRegex.matches(in: searchable, range: searchRange) {
             let range = match.range(at: 1)
             let target = nsBody.substring(with: range).trimmingCharacters(in: .whitespacesAndNewlines)
             guard let resolved = resolveWikiTarget(
@@ -188,23 +204,25 @@ enum VaultLinkRefactor {
             replacements.append((range, replacement))
         }
 
-        return replacing(body, replacements: replacements)
+        return replacements
     }
 
-    private static func rewriteMarkdownLinks(
+    /// Replacement ranges for Markdown link targets in `body`, indexed the
+    /// same way as `wikiLinkReplacements`.
+    private static func markdownLinkReplacements(
         in body: String,
+        searchable: String,
         sourceURL: URL,
         destinationSourceURL: URL,
         oldRoot: URL,
         newRoot: URL,
         sourceIsDirectory: Bool
-    ) -> String {
-        guard let regex = try? NSRegularExpression(pattern: #"!?\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)"#) else { return body }
-        let searchable = MarkdownNoteLinkExtractor.maskingCodeRegions(body)
+    ) -> [(NSRange, String)] {
         let nsBody = body as NSString
+        let searchRange = NSRange(location: 0, length: (searchable as NSString).length)
         var replacements: [(NSRange, String)] = []
 
-        for match in regex.matches(in: searchable, range: NSRange(location: 0, length: (searchable as NSString).length)) {
+        for match in markdownLinkRegex.matches(in: searchable, range: searchRange) {
             let range = match.range(at: 1)
             let rawTarget = nsBody.substring(with: range)
             guard URL(string: rawTarget)?.scheme == nil else { continue }
@@ -222,7 +240,7 @@ enum VaultLinkRefactor {
             let relative = relativePath(from: destinationSourceURL.deletingLastPathComponent(), to: mapped)
             replacements.append((range, relative.replacingOccurrences(of: " ", with: "%20")))
         }
-        return replacing(body, replacements: replacements)
+        return replacements
     }
 
     private static func resolveWikiTarget(

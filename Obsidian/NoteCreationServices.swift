@@ -183,7 +183,10 @@ struct TemplateNoteService {
         timeZone: TimeZone = .current
     ) throws -> URL {
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A leading dot would create a hidden file that neither the sidebar
+        // nor the template list shows, so the note would vanish on creation.
         guard !cleanTitle.isEmpty,
+              !cleanTitle.hasPrefix("."),
               cleanTitle.rangeOfCharacter(from: CharacterSet(charactersIn: "/:\n\r")) == nil else {
             throw NoteWorkflowFileError.unsafeRelativePath(title)
         }
@@ -217,6 +220,13 @@ struct TemplateNoteService {
 }
 
 struct DailyNoteService {
+    /// Obsidian formats daily-note names in English with Moment's default
+    /// week rules unless the user changes Obsidian's own language, so file
+    /// names are generated with this locale unless a caller opts in to
+    /// another one. Following the macOS language or region would create a
+    /// second note per day next to the one Obsidian writes.
+    static let canonicalLocale = Locale(identifier: "en_US_POSIX")
+
     private let fileManager: FileManager
     private let templateService: TemplateLibraryService
 
@@ -232,17 +242,17 @@ struct DailyNoteService {
         in vaultURL: URL,
         date: Date = Date(),
         timeZone: TimeZone = .current,
+        locale: Locale = DailyNoteService.canonicalLocale,
         configuration: DailyNoteConfiguration,
         templateConfiguration: TemplateLibraryConfiguration = .default
     ) throws -> DailyNoteCreationResult {
         let datedPath = try Self.relativeDatedPath(
             for: date,
             dateFormat: configuration.dateFormat,
-            timeZone: timeZone
+            timeZone: timeZone,
+            locale: locale
         )
-        let combinedPath = [configuration.folderPath, datedPath]
-            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            .joined(separator: "/")
+        let combinedPath = Self.combinedPath(folderPath: configuration.folderPath, datedPath: datedPath)
         let destinationURL = try VaultRelativePath.destinationFileURL(
             root: vaultURL,
             relativePath: combinedPath,
@@ -255,6 +265,28 @@ struct DailyNoteService {
                 throw NoteWorkflowFileError.destinationIsDirectory(destinationURL.path)
             }
             return DailyNoteCreationResult(fileURL: destinationURL, wasCreated: false)
+        }
+
+        // A localized name must not hide the note Obsidian (or an earlier
+        // launch) already wrote under the canonical English name today.
+        if locale.identifier != Self.canonicalLocale.identifier,
+           let canonicalPath = try? Self.relativeDatedPath(
+               for: date,
+               dateFormat: configuration.dateFormat,
+               timeZone: timeZone,
+               locale: Self.canonicalLocale
+           ),
+           canonicalPath != datedPath,
+           let canonicalURL = try? VaultRelativePath.destinationFileURL(
+               root: vaultURL,
+               relativePath: Self.combinedPath(folderPath: configuration.folderPath, datedPath: canonicalPath),
+               fileManager: fileManager
+           ) {
+            var isCanonicalDirectory: ObjCBool = false
+            if fileManager.fileExists(atPath: canonicalURL.path, isDirectory: &isCanonicalDirectory),
+               !isCanonicalDirectory.boolValue {
+                return DailyNoteCreationResult(fileURL: canonicalURL, wasCreated: false)
+            }
         }
 
         let content: String
@@ -295,19 +327,33 @@ struct DailyNoteService {
         return DailyNoteCreationResult(fileURL: verifiedURL, wasCreated: created)
     }
 
+    private static func combinedPath(folderPath: String, datedPath: String) -> String {
+        [folderPath, datedPath]
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .joined(separator: "/")
+    }
+
+    /// Month and weekday names follow `locale` (English by default, like
+    /// Obsidian), while the calendar stays Gregorian and every numeric value
+    /// (week numbers, weekday index) follows Moment's default English rules,
+    /// so neither the region nor the calendar preference can shift a name.
     static func relativeDatedPath(
         for date: Date,
         dateFormat: String,
-        timeZone: TimeZone
+        timeZone: TimeZone,
+        locale: Locale = DailyNoteService.canonicalLocale
     ) throws -> String {
         let trimmedFormat = dateFormat.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedFormat.isEmpty else { throw NoteWorkflowFileError.invalidDateFormat }
 
         let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.locale = Self.formattingLocale(locale)
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.timeZone = timeZone
-        formatter.dateFormat = ObsidianDateFormat.foundationFormat(from: trimmedFormat)
+        formatter.dateFormat = try ObsidianDateFormat.foundationFormat(
+            from: trimmedFormat,
+            fields: MomentDateFields(date: date, timeZone: timeZone)
+        )
 
         var path = formatter.string(from: date)
         guard !path.isEmpty else { throw NoteWorkflowFileError.invalidDateFormat }
@@ -320,24 +366,215 @@ struct DailyNoteService {
         }
         return path
     }
+
+    /// Keeps digits Latin regardless of the locale's numbering system so a
+    /// Daily Note's file name never changes script between launches.
+    private static func formattingLocale(_ locale: Locale) -> Locale {
+        var components = Locale.Components(locale: locale)
+        components.numberingSystem = Locale.NumberingSystem("latn")
+        return Locale(components: components)
+    }
 }
 
-private enum ObsidianDateFormat {
-    /// Obsidian's default `YYYY-MM-DD` uses Moment tokens, while DateFormatter
-    /// interprets capital Y/D as week-year/day-of-year. Translate the common
-    /// tokens so copied Daily Notes settings retain their intended dates.
-    static func foundationFormat(from source: String) -> String {
-        let replacements: [(String, String)] = [
-            ("dddd", "EEEE"),
-            ("ddd", "EEE"),
-            ("YYYY", "yyyy"),
-            ("YY", "yy"),
-            ("DD", "dd"),
-            ("D", "d")
-        ]
-        return replacements.reduce(source) { value, replacement in
-            value.replacingOccurrences(of: replacement.0, with: replacement.1)
+/// Values for Moment tokens whose ICU counterpart numbers things differently
+/// (or not at all), computed with Moment's default English rules: weeks start
+/// on Sunday and week 1 contains January 1st; `W`/`G` tokens are ISO weeks.
+struct MomentDateFields: Equatable, Sendable {
+    /// 0...6, Sunday = 0 (Moment `d`, `e`).
+    let weekday: Int
+    /// 1...7, Monday = 1 (Moment `E`).
+    let isoWeekday: Int
+    /// Moment `w` and `gg`/`gggg`.
+    let week: Int
+    let weekYear: Int
+    /// Moment `W` and `GG`/`GGGG`.
+    let isoWeek: Int
+    let isoWeekYear: Int
+    let hour: Int
+
+    init(date: Date, timeZone: TimeZone) {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        calendar.firstWeekday = 1
+        calendar.minimumDaysInFirstWeek = 1
+        var isoCalendar = Calendar(identifier: .iso8601)
+        isoCalendar.timeZone = timeZone
+
+        weekday = calendar.component(.weekday, from: date) - 1
+        isoWeekday = (weekday + 6) % 7 + 1
+        week = calendar.component(.weekOfYear, from: date)
+        weekYear = calendar.component(.yearForWeekOfYear, from: date)
+        isoWeek = isoCalendar.component(.weekOfYear, from: date)
+        isoWeekYear = isoCalendar.component(.yearForWeekOfYear, from: date)
+        hour = calendar.component(.hour, from: date)
+    }
+}
+
+enum ObsidianDateFormat {
+    private enum Field: Sendable {
+        case weekday, isoWeekday
+        case week, weekPadded, weekYear2, weekYear4
+        case isoWeek, isoWeekPadded, isoWeekYear2, isoWeekYear4
+        case meridiemUpper, meridiemLower
+
+        func text(from fields: MomentDateFields) -> String {
+            switch self {
+            case .weekday: String(fields.weekday)
+            case .isoWeekday: String(fields.isoWeekday)
+            case .week: String(fields.week)
+            case .weekPadded: String(format: "%02d", fields.week)
+            case .weekYear2: String(format: "%02d", fields.weekYear % 100)
+            case .weekYear4: String(format: "%04d", fields.weekYear)
+            case .isoWeek: String(fields.isoWeek)
+            case .isoWeekPadded: String(format: "%02d", fields.isoWeek)
+            case .isoWeekYear2: String(format: "%02d", fields.isoWeekYear % 100)
+            case .isoWeekYear4: String(format: "%04d", fields.isoWeekYear)
+            case .meridiemUpper: fields.hour < 12 ? "AM" : "PM"
+            case .meridiemLower: fields.hour < 12 ? "am" : "pm"
+            }
         }
+    }
+
+    private enum Action: Sendable {
+        /// Same meaning in ICU, possibly under another spelling.
+        case icu(String)
+        /// Evaluated up front and emitted as a quoted literal.
+        case field(Field)
+        /// A Moment token with no faithful ICU equivalent (ordinals, eras,
+        /// fractional seconds, time zones, ...). A clear error beats a file
+        /// name that silently differs from the one Obsidian would write.
+        case reject
+    }
+
+    /// Every Moment token, matched longest first so `YYYY` is consumed before
+    /// `YY` and `dddd` before `dd`. Characters that are not part of a token
+    /// are literal text, as in Moment.
+    private static let tokenTable: [(moment: String, action: Action)] = {
+        var table: [(moment: String, action: Action)] = [
+            ("YYYY", .icu("yyyy")), ("YY", .icu("yy")), ("Y", .icu("y")),
+            ("Q", .icu("Q")),
+            ("MMMM", .icu("MMMM")), ("MMM", .icu("MMM")), ("MM", .icu("MM")), ("M", .icu("M")),
+            ("DDDD", .icu("DDD")), ("DDD", .icu("D")), ("DD", .icu("dd")), ("D", .icu("d")),
+            ("dddd", .icu("EEEE")), ("ddd", .icu("EEE")), ("dd", .icu("EEEEEE")),
+            ("d", .field(.weekday)), ("e", .field(.weekday)), ("E", .field(.isoWeekday)),
+            ("ww", .field(.weekPadded)), ("w", .field(.week)),
+            ("WW", .field(.isoWeekPadded)), ("W", .field(.isoWeek)),
+            ("gggg", .field(.weekYear4)), ("gg", .field(.weekYear2)),
+            ("GGGG", .field(.isoWeekYear4)), ("GG", .field(.isoWeekYear2)),
+            ("HH", .icu("HH")), ("H", .icu("H")), ("hh", .icu("hh")), ("h", .icu("h")),
+            ("kk", .icu("kk")), ("k", .icu("k")),
+            ("mm", .icu("mm")), ("m", .icu("m")), ("ss", .icu("ss")), ("s", .icu("s")),
+            ("A", .field(.meridiemUpper)), ("a", .field(.meridiemLower)),
+            // Ordinals and the remaining tokens ICU cannot express faithfully.
+            ("Mo", .reject), ("Qo", .reject), ("Do", .reject), ("DDDo", .reject),
+            ("do", .reject), ("wo", .reject), ("Wo", .reject), ("yo", .reject),
+            ("ggggg", .reject), ("GGGGG", .reject),
+            ("YYYYYY", .reject), ("YYYYY", .reject),
+            ("y", .reject), ("yy", .reject), ("yyy", .reject), ("yyyy", .reject),
+            ("N", .reject), ("NN", .reject), ("NNN", .reject), ("NNNN", .reject), ("NNNNN", .reject),
+            ("x", .reject), ("X", .reject),
+            ("z", .reject), ("zz", .reject), ("Z", .reject), ("ZZ", .reject),
+        ]
+        for count in 1...9 {
+            table.append((String(repeating: "S", count: count), .reject))
+        }
+        return table.sorted { $0.moment.count > $1.moment.count }
+    }()
+
+    /// Obsidian's default `YYYY-MM-DD` uses Moment tokens, while DateFormatter
+    /// interprets capital Y/D as week-year/day-of-year. Translate the format
+    /// token by token so copied Daily Notes settings retain their intended
+    /// dates: `[...]` and any non-token letter become quoted ICU literals,
+    /// `\` escapes the following token, tokens that depend on week rules or
+    /// number differently in ICU are evaluated from `fields`, and tokens that
+    /// cannot be reproduced (every ordinal such as `Do`, eras, time zones,
+    /// fractional seconds), an unbalanced `[`, or two adjacent tokens ICU
+    /// would fuse into one are rejected.
+    static func foundationFormat(from source: String, fields: MomentDateFields? = nil) throws -> String {
+        var result = ""
+        // Literal text is gathered here so adjacent literals form one quoted
+        // run; emitting `'A'` next to `'B'` would read back as `A'B`.
+        var pendingLiteral = ""
+        var lastICULetter: Character?
+        var remainder = Substring(source)
+
+        func flushLiteral() {
+            guard !pendingLiteral.isEmpty else { return }
+            // An apostrophe at the edge of a quoted run would read back as an
+            // escaped quote, so edge apostrophes are emitted outside the quotes.
+            var core = Substring(pendingLiteral)
+            var leading = 0
+            while core.first == "'" {
+                core.removeFirst()
+                leading += 1
+            }
+            var trailing = 0
+            while core.last == "'" {
+                core.removeLast()
+                trailing += 1
+            }
+            result += String(repeating: "''", count: leading)
+            if !core.isEmpty {
+                result += "'" + core.replacingOccurrences(of: "'", with: "''") + "'"
+            }
+            result += String(repeating: "''", count: trailing)
+            pendingLiteral = ""
+        }
+
+        while let character = remainder.first {
+            switch character {
+            case "[":
+                let body = remainder.dropFirst()
+                guard let close = body.firstIndex(of: "]"),
+                      !body[..<close].contains("[") else {
+                    throw NoteWorkflowFileError.invalidDateFormat
+                }
+                pendingLiteral += body[..<close]
+                remainder = body[body.index(after: close)...]
+                lastICULetter = nil
+            case "\\":
+                remainder.removeFirst()
+                guard let escaped = remainder.first else { continue }
+                if escaped == "[" { throw NoteWorkflowFileError.invalidDateFormat }
+                // Moment escapes a whole token ("\YYYY" prints YYYY).
+                let length = tokenTable.first(where: { remainder.hasPrefix($0.moment) })?.moment.count ?? 1
+                pendingLiteral += remainder.prefix(length)
+                remainder.removeFirst(length)
+                lastICULetter = nil
+            default:
+                if let token = tokenTable.first(where: { remainder.hasPrefix($0.moment) }) {
+                    switch token.action {
+                    case .reject:
+                        throw NoteWorkflowFileError.invalidDateFormat
+                    case .field(let field):
+                        guard let fields else { throw NoteWorkflowFileError.invalidDateFormat }
+                        pendingLiteral += field.text(from: fields)
+                        lastICULetter = nil
+                    case .icu(let pattern):
+                        guard lastICULetter != pattern.first else {
+                            throw NoteWorkflowFileError.invalidDateFormat
+                        }
+                        flushLiteral()
+                        result += pattern
+                        lastICULetter = pattern.first
+                    }
+                    remainder.removeFirst(token.moment.count)
+                } else if character == "'" || (character.isASCII && character.isLetter) {
+                    // Moment prints unknown letters and apostrophes as text.
+                    pendingLiteral.append(character)
+                    lastICULetter = nil
+                    remainder.removeFirst()
+                } else {
+                    flushLiteral()
+                    result.append(character)
+                    lastICULetter = nil
+                    remainder.removeFirst()
+                }
+            }
+        }
+
+        flushLiteral()
+        return result
     }
 }
 
@@ -506,13 +743,52 @@ enum ExclusiveAtomicFileWriter {
         }
 
         let errorCode = errno
-        if errorCode == EEXIST {
+        switch errorCode {
+        case EEXIST:
             return false
+        case ENOTSUP, EINVAL:
+            // Network and FUSE volumes may not implement RENAME_EXCL. O_EXCL
+            // still lets exactly one creator win, so fall back to it there.
+            return try createExclusively(data, at: destinationURL, fileManager: fileManager)
+        default:
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errorCode),
+                userInfo: [NSFilePathErrorKey: destinationURL.path]
+            )
         }
-        throw NSError(
-            domain: NSPOSIXErrorDomain,
-            code: Int(errorCode),
-            userInfo: [NSFilePathErrorKey: destinationURL.path]
-        )
+    }
+
+    private static func createExclusively(
+        _ data: Data,
+        at destinationURL: URL,
+        fileManager: FileManager
+    ) throws -> Bool {
+        let descriptor = open(destinationURL.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o644)
+        guard descriptor >= 0 else {
+            let errorCode = errno
+            if errorCode == EEXIST {
+                return false
+            }
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errorCode),
+                userInfo: [NSFilePathErrorKey: destinationURL.path]
+            )
+        }
+
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        do {
+            try handle.write(contentsOf: data)
+            try handle.synchronize()
+            try handle.close()
+        } catch {
+            try? handle.close()
+            // The note exists but is incomplete; never leave a truncated
+            // file behind for the next launch to open as today's note.
+            try? fileManager.removeItem(at: destinationURL)
+            throw error
+        }
+        return true
     }
 }

@@ -458,11 +458,10 @@ struct SidebarRootDropArea: View {
 struct BacklinksSection: View {
     let workspace: Workspace
 
-    private var backlinks: [NoteGraphNode] {
-        workspace.noteGraph.backlinks(to: workspace.selectedFileURL)
-    }
-
     var body: some View {
+        // Resolved once per render; the graph walk is O(edges).
+        let backlinks = workspace.noteGraph.backlinks(to: workspace.selectedFileURL)
+
         if !backlinks.isEmpty {
             Section {
                 ForEach(backlinks) { node in
@@ -695,13 +694,20 @@ enum SidebarExpansionPersistence {
         )
     }
 
+    /// Live filter applied on every `sidebarNodes` change. Both sets come from
+    /// the same sidebar snapshot, so a plain standardized-URL intersection is
+    /// enough; resolving symlinks for every folder is reserved for the
+    /// stored-path restore below.
     static func filteredExpandedFolderURLs(
         _ expandedFolderURLs: Set<URL>,
         validFolderURLs: Set<URL>
     ) -> Set<URL> {
-        let validFoldersByPath = keyedByCanonicalPath(validFolderURLs)
+        let validFoldersByStandardizedURL = Dictionary(
+            validFolderURLs.map { ($0.standardizedFileURL, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
         return Set(
-            expandedFolderURLs.compactMap { validFoldersByPath[canonicalPath(for: $0)] }
+            expandedFolderURLs.compactMap { validFoldersByStandardizedURL[$0.standardizedFileURL] }
         )
     }
 

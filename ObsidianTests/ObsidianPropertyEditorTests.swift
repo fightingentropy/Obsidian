@@ -32,4 +32,33 @@ final class ObsidianPropertyEditorTests: XCTestCase {
             "---\nstatus: active\n---\nBody"
         )
     }
+
+    func testEditsBOMPrefixedNoteAndKeepsTheBOM() throws {
+        let updated = try ObsidianPropertyEditor.setting(
+            key: "status",
+            value: .string("done"),
+            in: "\u{feff}---\nstatus: draft\n---\nBody"
+        )
+        XCTAssertEqual(updated, "\u{feff}---\nstatus: \"done\"\n---\nBody")
+    }
+
+    func testColumnZeroListItemsStayWithTheirKey() throws {
+        let updated = try ObsidianPropertyEditor.setting(
+            key: "links",
+            value: .strings(["c"]),
+            in: "---\nlinks:\n- url: a\n- url: b\nstatus: active\n---\nBody"
+        )
+        XCTAssertEqual(updated, "---\nlinks: [\"c\"]\nstatus: active\n---\nBody")
+    }
+
+    func testWritesIntegralNumbersWithoutFractionalPart() throws {
+        XCTAssertEqual(
+            try ObsidianPropertyEditor.setting(key: "priority", value: .number(3), in: "Body"),
+            "---\npriority: 3\n---\nBody"
+        )
+        XCTAssertEqual(
+            try ObsidianPropertyEditor.setting(key: "weight", value: .number(2.5), in: "Body"),
+            "---\nweight: 2.5\n---\nBody"
+        )
+    }
 }

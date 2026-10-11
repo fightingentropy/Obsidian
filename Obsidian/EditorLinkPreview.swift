@@ -2,14 +2,6 @@ import AppKit
 import SwiftUI
 @preconcurrency import WebKit
 
-private final class ScrollWheelMonitorToken: @unchecked Sendable {
-    let value: Any
-
-    init(_ value: Any) {
-        self.value = value
-    }
-}
-
 enum EditorLinkPreviewKind: Equatable {
     case xPost(username: String, statusID: String)
     case youtube(videoID: String)
@@ -45,9 +37,10 @@ struct EditorLinkPreview: Equatable, Identifiable {
         }
     }
 
-    var thumbnailURL: URL? {
-        guard case .youtube(let videoID) = kind else { return nil }
-        return URL(string: "https://i.ytimg.com/vi/\(videoID)/mqdefault.jpg")
+    /// Poster frames for the YouTube thumbnail card, best first.
+    var thumbnailURLs: [URL] {
+        guard case .youtube(let videoID) = kind else { return [] }
+        return YouTubeThumbnail.urls(videoID: videoID)
     }
 
     var youtubeStartSeconds: Int? {
@@ -61,17 +54,19 @@ struct EditorLinkPreview: Equatable, Identifiable {
         return Self.parseYouTubeTime(rawValue)
     }
 
+    /// Compiled once: `youtubeStartSeconds` runs on every update of every visible card.
+    private static let youtubeTimeExpression = try! NSRegularExpression(
+        pattern: #"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$"#,
+        options: [.caseInsensitive]
+    )
+
     private static func parseYouTubeTime(_ rawValue: String) -> Int? {
         if let seconds = Int(rawValue), seconds >= 0 {
             return seconds
         }
 
-        let expression = try? NSRegularExpression(
-            pattern: #"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$"#,
-            options: [.caseInsensitive]
-        )
         let range = NSRange(rawValue.startIndex..<rawValue.endIndex, in: rawValue)
-        guard let match = expression?.firstMatch(in: rawValue, range: range),
+        guard let match = youtubeTimeExpression.firstMatch(in: rawValue, range: range),
               match.range == range else {
             return nil
         }
@@ -554,6 +549,8 @@ final class EditorLinkPreviewController {
     private var measuredXCardWidths: [String: Int] = [:]
     private var cardPreviews: [String: EditorLinkPreview] = [:]
     private var hoveredPreviewIDs: Set<String> = []
+    /// The one wheel forwarder for every card in the text view; cards built
+    /// here therefore opt out of `EmbedScrollForwarder`.
     private var scrollWheelMonitor: ScrollWheelMonitorToken?
     private var openURLHandler: ((URL) -> Void)?
 
@@ -831,7 +828,8 @@ final class EditorLinkPreviewController {
                 youtubeHoverChanged: { [weak self, weak textView] isHovering in
                     guard let self, let textView else { return }
                     self.setHover(isHovering, for: preview, in: textView)
-                }
+                },
+                forwardsScrollWheel: false
             )
             if let existing = cardViews[preview.id] {
                 existing.rootView = card
@@ -1077,6 +1075,18 @@ enum YouTubeEmbedURL {
             components.queryItems?.append(URLQueryItem(name: "origin", value: origin.absoluteString))
         }
         return components.url
+    }
+}
+
+/// YouTube publishes poster frames at fixed paths. `maxresdefault` (1280×720)
+/// exists only for HD uploads; `hqdefault` (480×360, letterboxed) exists for
+/// every public video, so it is the fallback.
+enum YouTubeThumbnail {
+    static func urls(videoID: String) -> [URL] {
+        guard !videoID.isEmpty, videoID.utf8.count <= 64,
+              videoID.unicodeScalars.allSatisfy({ $0.isASCII && (CharacterSet.alphanumerics.contains($0) || $0 == "-" || $0 == "_") })
+        else { return [] }
+        return ["maxresdefault", "hqdefault"].compactMap { URL(string: "https://i.ytimg.com/vi/\(videoID)/\($0).jpg") }
     }
 }
 

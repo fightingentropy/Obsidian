@@ -56,7 +56,10 @@ private struct NoteTab: View {
     }
 
     private var title: String {
-        workspace.tabTitle(for: url)
+        if let file = workspace.fileItem(for: url) {
+            return workspace.title(for: file)
+        }
+        return url.deletingPathExtension().lastPathComponent
     }
 
     var body: some View {
@@ -156,14 +159,5 @@ enum NoteTabCoordinator {
             session.noteSelected(url)
         }
         return transitionSucceeded
-    }
-}
-
-private extension Workspace {
-    func tabTitle(for url: URL) -> String {
-        if let file = files.first(where: { $0.url.standardizedFileURL == url.standardizedFileURL }) {
-            return title(for: file)
-        }
-        return url.deletingPathExtension().lastPathComponent
     }
 }

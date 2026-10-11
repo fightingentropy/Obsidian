@@ -30,8 +30,12 @@ enum UnlinkedMentionFinder {
             .sorted { $0.count > $1.count }
         guard !names.isEmpty else { return [] }
 
+        // The search itself is a plain NSString scan per name (no regex or
+        // folding), so the only per-source work worth hoisting is the
+        // excluded URL, which was being re-standardized for every source.
+        let excludedURL = targetURL?.standardizedFileURL
         var mentions: [UnlinkedMention] = []
-        for source in sources where source.url.standardizedFileURL != targetURL?.standardizedFileURL {
+        for source in sources where source.url.standardizedFileURL != excludedURL {
             let nsBody = source.body as NSString
             var occupiedRanges: [NSRange] = []
 

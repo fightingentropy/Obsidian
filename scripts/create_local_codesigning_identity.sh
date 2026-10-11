@@ -54,15 +54,21 @@ openssl pkcs12 \
   -out "$tmpdir/$name.p12" \
   -passout "pass:$p12_password" >/dev/null 2>&1
 
+# Only codesign gets unattended access to the private key (not every app, as
+# -A would allow). macOS may still ask once to let codesign use the key; choose
+# "Always Allow".
 security import "$tmpdir/$name.p12" \
   -k "$keychain" \
   -P "$p12_password" \
-  -A \
+  -T /usr/bin/codesign \
   -f pkcs12 >/dev/null
 
+# Trust the self-signed certificate for code signing only, in the login
+# keychain's user trust domain. Local builds are signed and run by this user,
+# so system-wide (-d) trust is not needed.
 security add-trusted-cert \
-  -d \
   -r trustRoot \
+  -p codeSign \
   -k "$keychain" \
   "$tmpdir/$name.cert.pem" >/dev/null
 

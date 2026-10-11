@@ -133,8 +133,9 @@ private func flowchartSVG(_ graph: FlowchartGraph) -> String {
         }
     }
 
-    for (id, node) in graph.nodes {
-        guard let pos = positions[id] else { continue }
+    // Source order keeps the SVG stable between renders; a dictionary walk does not.
+    for id in graph.nodeOrder {
+        guard let node = graph.nodes[id], let pos = positions[id] else { continue }
         let cx = pos.x + pad, cy = pos.y + pad
         switch node.shape {
         case .rect:

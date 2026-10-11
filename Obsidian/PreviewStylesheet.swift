@@ -2,21 +2,64 @@ import Foundation
 
 @MainActor
 enum PreviewStylesheet {
-    private static let pageCache: NSCache<NSString, NSString> = {
-        let cache = NSCache<NSString, NSString>()
-        cache.countLimit = 8
-        cache.totalCostLimit = 4 * 1_024 * 1_024
-        return cache
-    }()
+    /// The preference values the stylesheet reads. Two `AppPreferences`
+    /// instances with equal signatures produce byte-identical CSS, so the
+    /// signature doubles as the memoization key here and as part of the
+    /// rendered-page cache key in the preview.
+    struct StyleSignature: Hashable, Sendable {
+        let fontFamily: String
+        let fontSize: Int
+        let pageWidth: Int
+        let codeFontFamily: String
+
+        // Nested types do not inherit the enclosing enum's actor isolation,
+        // and `AppPreferences` is main-actor bound.
+        @MainActor
+        init(preferences: AppPreferences) {
+            fontFamily = preferences.previewFontChoice.cssFontFamily
+            fontSize = Int(preferences.previewFontSize.rounded())
+            pageWidth = Int(preferences.previewPageWidth.rounded())
+            codeFontFamily = preferences.previewCodeFontChoice.cssFontFamily
+        }
+    }
+
+    // Single-entry memo of the generated stylesheet. The preferences change
+    // rarely while the page is re-rendered on every keystroke, so one slot is
+    // enough. `page(...)` itself is not memoized here (the preview keeps a
+    // page cache of its own); instead it is a pure function of its inputs, so
+    // an unchanged body always yields a byte-identical page and the web view
+    // is not reloaded.
+    private static var cachedStylesheet: (signature: StyleSignature, css: String)?
+
+    // Process-lifetime secret mixed into every CSP nonce. Together with
+    // `Hasher`'s per-process random seed it keeps nonces unpredictable to
+    // anyone authoring note content, while letting the same body map to the
+    // same nonce.
+    private static let nonceSalt = UUID().uuidString
+
+    /// Derives the CSP nonce from the page body instead of minting a random
+    /// one per call. A random nonce made every render differ byte for byte,
+    /// which made `HTMLPreviewWebView` reload (and flicker) an unchanged page.
+    private static func makeNonce(forBody body: String) -> String {
+        var first = Hasher()
+        first.combine(nonceSalt)
+        first.combine(body)
+        var second = Hasher()
+        second.combine(body)
+        second.combine(nonceSalt)
+        second.combine(1 as UInt8)
+        let high = String(UInt64(bitPattern: Int64(first.finalize())), radix: 16)
+        let low = String(UInt64(bitPattern: Int64(second.finalize())), radix: 16)
+        return "n" + high + low
+    }
 
     static func page(body: String, preferences: AppPreferences, compact: Bool = false) -> String {
         let stylesheet = css(using: preferences)
-        let key = (stylesheet + "\n" + String(compact) + "\n" + body) as NSString
-        if let cached = pageCache.object(forKey: key) { return cached as String }
         let needsMath = body.contains("class=\"math-inline\"") || body.contains("class=\"math-display\"")
         let mathAssets = needsMath ? mathAssetsHTML : ""
-        // Per-render nonce authorizes only our own inline bootstrap script.
-        let nonce = UUID().uuidString
+        // The nonce authorizes only our own inline bootstrap script. Raw user
+        // HTML is escaped before rendering, so it is never injectable.
+        let nonce = makeNonce(forBody: body)
 
         // Defense-in-depth CSP. Even though cmark now renders in safe mode (no
         // raw user HTML, no unsafe link schemes), this hard-stops the
@@ -50,7 +93,6 @@ enum PreviewStylesheet {
         <body>\(body)\(needsMath ? mathBootstrapScript(nonce: nonce) : "")</body>
         </html>
         """
-        pageCache.setObject(page as NSString, forKey: key, cost: page.utf8.count + key.length * 2)
         return page
     }
 
@@ -85,10 +127,24 @@ enum PreviewStylesheet {
     }
 
     static func css(using preferences: AppPreferences) -> String {
-        let previewFontFamily = preferences.previewFontChoice.cssFontFamily
-        let previewFontSize = Int(preferences.previewFontSize.rounded())
-        let previewPageWidth = Int(preferences.previewPageWidth.rounded())
-        let previewCodeFontFamily = preferences.previewCodeFontChoice.cssFontFamily
+        css(for: StyleSignature(preferences: preferences))
+    }
+
+    static func css(for signature: StyleSignature) -> String {
+        if let cachedStylesheet, cachedStylesheet.signature == signature {
+            return cachedStylesheet.css
+        }
+
+        let stylesheet = buildCSS(for: signature)
+        cachedStylesheet = (signature, stylesheet)
+        return stylesheet
+    }
+
+    private static func buildCSS(for signature: StyleSignature) -> String {
+        let previewFontFamily = signature.fontFamily
+        let previewFontSize = signature.fontSize
+        let previewPageWidth = signature.pageWidth
+        let previewCodeFontFamily = signature.codeFontFamily
 
         return """
     * { margin: 0; padding: 0; box-sizing: border-box; }

@@ -36,4 +36,19 @@ final class UnlinkedMentionsTests: XCTestCase {
         )
         XCTAssertNil(UnlinkedMentionFinder.replacingMention(mention, in: body + " Changed"))
     }
+
+    func testSkipsTheTargetNoteItself() {
+        let target = URL(fileURLWithPath: "/tmp/Atlas.md")
+        let other = URL(fileURLWithPath: "/tmp/Other.md")
+        let mentions = UnlinkedMentionFinder.find(
+            targetNames: ["Atlas"],
+            sources: [
+                (target, "Atlas", "Atlas mentions itself."),
+                (other, "Other", "Atlas is mentioned here."),
+            ],
+            excluding: URL(fileURLWithPath: "/tmp/./Atlas.md")
+        )
+
+        XCTAssertEqual(mentions.map(\.sourceURL), [other])
+    }
 }

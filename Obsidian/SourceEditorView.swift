@@ -312,7 +312,7 @@ struct SourceEditorView: NSViewRepresentable {
 
         context.coordinator.parent = self
         context.coordinator.observeSizeChanges(of: scrollView)
-        context.coordinator.primeContentHash(for: text)
+        context.coordinator.primeKnownText(text)
         context.coordinator.applyTextLayout(for: scrollView, textView: textView)
         _ = context.coordinator.setCurrentDocument(documentURL)
         context.coordinator.primeAppearanceSignature()
@@ -440,28 +440,116 @@ struct SourceEditorView: NSViewRepresentable {
         private var pendingLinkPreviewRefresh: DispatchWorkItem?
         private var lastAppliedLayoutSignature: LayoutSignature?
         private let linkPreviewController = EditorLinkPreviewController()
-        /// Hash of the text currently shown in the editor, refreshed whenever the
-        /// editor content changes (user edit or applied external text). Lets
-        /// `updateNSView` skip the O(n) `textView.string != text` comparison when
-        /// the incoming binding hashes identically.
-        private var editorContentHash: Int?
+        /// The text this coordinator last pushed to the binding or applied from
+        /// it. `updateNSView` compares the incoming binding against it with
+        /// `==` first: Swift `String` equality returns immediately when both
+        /// values share storage, which is the case when SwiftUI hands back the
+        /// string this coordinator produced, so an unrelated update skips the
+        /// O(n) `textView.string != text` comparison (and the O(n) hash that
+        /// used to stand in for it).
+        private var lastKnownText: String?
 
+        /// Imports that were started here and have not landed yet, with the
+        /// spot each one will land at. Nothing is typed into the note while an
+        /// import runs, so no temporary text can reach the model, be autosaved
+        /// or come back through undo; `textView(_:shouldChangeTextIn:...)`
+        /// keeps each anchor in step with later edits.
+        private var pendingAttachmentImports: [UUID: AttachmentImportAnchor] = [:]
+        private var attachmentImportTasks: [UUID: Task<Void, Never>] = [:]
+
+        /// Takes over a paste or drop that carries a file or image. Only the
+        /// pasteboard read happens here: the transcode, copy and fsync'd write
+        /// run off the main actor, so a large screenshot never freezes typing.
+        /// The embed is inserted, as one undoable edit, once the import lands
+        /// and only if the editor still shows the note it was started in.
         func sourceTextView(_ textView: NSTextView, importAttachmentFrom pasteboard: NSPasteboard) -> Bool {
+            let request: AttachmentImportRequest
             do {
-                guard let attachment = try AttachmentStore.importFirstAttachment(
+                guard let pendingRequest = try AttachmentStore.importRequest(
                     from: pasteboard,
                     documentURL: parent.documentURL,
                     vaultURL: parent.vaultURL
                 ) else {
                     return false
                 }
-
-                textView.insertText(attachment.markdownEmbed, replacementRange: textView.selectedRange())
-                return true
+                request = pendingRequest
             } catch {
                 NSSound.beep()
                 return false
             }
+
+            let importID = UUID()
+            pendingAttachmentImports[importID] = AttachmentImportAnchor(range: textView.selectedRange())
+
+            attachmentImportTasks[importID] = Task { @MainActor [weak self, weak textView] in
+                let attachment = try? await AttachmentStore.importAttachment(request)
+                self?.completeAttachmentImport(importID, attachment: attachment, in: textView)
+            }
+            return true
+        }
+
+        /// Waits for every import started here to finish and land (or be
+        /// dropped). Lets tests await the background work deterministically.
+        func settleAttachmentImports() async {
+            for task in Array(attachmentImportTasks.values) {
+                await task.value
+            }
+        }
+
+        /// Lands a finished import. An import the editor has moved on from
+        /// (another note was opened, the text was replaced from outside, or
+        /// the view was torn down so this never runs) is dropped silently: the
+        /// copied file stays in the attachments folder and the note is
+        /// untouched. A failed import leaves the note as it was.
+        private func completeAttachmentImport(
+            _ importID: UUID,
+            attachment: ImportedAttachment?,
+            in textView: NSTextView?
+        ) {
+            attachmentImportTasks[importID] = nil
+            guard let anchor = pendingAttachmentImports.removeValue(forKey: importID) else { return }
+            guard let attachment else {
+                NSSound.beep()
+                return
+            }
+            // The binding is the note the model holds right now. SwiftUI can
+            // be a beat behind a note switch, so when the editor and the model
+            // disagree about the text, this editor is not showing the note
+            // the import was made in and must not push anything back.
+            guard let textView, parent.text == textView.string else { return }
+            Coordinator.finishAttachmentImport(anchor, with: attachment.markdownEmbed, in: textView)
+        }
+
+        /// Replaces the anchored text (or inserts at the anchored caret) with
+        /// `replacement` as one undoable edit, and keeps the caret where the
+        /// user left it, after an ordinary paste's insertion when it has not
+        /// moved. Returns false, changing nothing, when the anchor no longer
+        /// fits the text or the view refuses the edit.
+        @discardableResult
+        static func finishAttachmentImport(
+            _ anchor: AttachmentImportAnchor,
+            with replacement: String,
+            in textView: NSTextView
+        ) -> Bool {
+            let range = anchor.range
+            guard range.location != NSNotFound,
+                  NSMaxRange(range) <= textView.documentNSString.length,
+                  let storage = textView.textStorage,
+                  textView.shouldChangeText(in: range, replacementString: replacement) else {
+                return false
+            }
+
+            let selection = AttachmentImportAnchor.adjustedSelection(
+                textView.selectedRange(),
+                afterReplacing: range,
+                withLength: (replacement as NSString).length
+            )
+            storage.replaceCharacters(in: range, with: replacement)
+            // Set before `didChangeText` so the text-change handling (link
+            // completion, highlighting) sees the caret where it will stay.
+            textView.setSelectedRange(selection)
+            textView.didChangeText()
+            return true
         }
 
         init(_ parent: SourceEditorView) {
@@ -554,6 +642,11 @@ struct SourceEditorView: NSViewRepresentable {
             let nextIdentity = documentIdentity(for: url)
             let didChange = currentDocumentIdentity != nextIdentity
             currentDocumentIdentity = nextIdentity
+            if didChange {
+                // An import made in the previous note must not land in this one,
+                // even when both notes happen to hold the same text.
+                pendingAttachmentImports.removeAll()
+            }
             return didChange
         }
 
@@ -569,6 +662,10 @@ struct SourceEditorView: NSViewRepresentable {
             // Any deferred full re-highlight is for the outgoing content; the
             // synchronous full pass below supersedes it.
             cancelPendingFullHighlight()
+
+            // The text is being replaced wholesale, so the spots in-flight
+            // imports were anchored to no longer mean anything.
+            pendingAttachmentImports.removeAll()
 
             if documentChanged {
                 isApplyingExternalText = true
@@ -597,22 +694,23 @@ struct SourceEditorView: NSViewRepresentable {
         }
 
         /// Cheap pre-check for whether the parent binding differs from what the
-        /// editor currently shows. Compares a cached content hash first and only
-        /// falls back to the O(n) string comparison when the hashes disagree (or
-        /// no hash is cached yet), avoiding a full-document compare on every
-        /// unrelated SwiftUI `updateNSView`.
+        /// editor currently shows. Compares against the last known text first
+        /// (an O(1) identity check when SwiftUI hands back the same storage)
+        /// and only falls back to the O(n) editor string comparison when the
+        /// strings differ or nothing is known yet, avoiding a full-document
+        /// compare on every unrelated SwiftUI `updateNSView`.
         private func contentDiffersFromExternalText(_ text: String, in textView: NSTextView) -> Bool {
-            if let editorContentHash, editorContentHash == text.hashValue {
+            if let lastKnownText, lastKnownText == text {
                 return false
             }
             return textView.string != text
         }
 
         private func noteEditorContent(_ text: String) {
-            editorContentHash = text.hashValue
+            lastKnownText = text
         }
 
-        func primeContentHash(for text: String) {
+        func primeKnownText(_ text: String) {
             noteEditorContent(text)
         }
 
@@ -659,19 +757,31 @@ struct SourceEditorView: NSViewRepresentable {
             )
         }
 
+        /// Re-highlights the editor. With an `incrementalRange` (computed once
+        /// per keystroke by `textDidChange`) only that span is recolored using
+        /// the code-block state decided there; without one the whole document
+        /// is rescanned.
         func highlight(
             _ textView: NSTextView,
             preservingViewport: Bool = true,
-            editedRange: NSRange? = nil
+            incrementalRange: SyntaxHighlighter.IncrementalRange? = nil
         ) {
             // A full pass resets paragraph styles before link previews reserve
             // their space again, so anchor across both halves of that reflow.
-            let fullRefreshAnchor = editedRange == nil
+            let fullRefreshAnchor = incrementalRange == nil
                 ? EditorViewportAnchor.capture(in: textView)
                 : nil
             let applyHighlighting = {
                 guard let storage = textView.textStorage else { return }
-                self.highlighter.highlight(storage, editedRange: editedRange)
+                if let incrementalRange {
+                    self.highlighter.highlight(
+                        storage,
+                        range: incrementalRange.range,
+                        codeBlockState: incrementalRange.codeBlockState
+                    )
+                } else {
+                    self.highlighter.highlight(storage)
+                }
             }
 
             if preservingViewport {
@@ -680,7 +790,7 @@ struct SourceEditorView: NSViewRepresentable {
                 applyHighlighting()
             }
 
-            if editedRange == nil {
+            if incrementalRange == nil {
                 cancelPendingLinkPreviewRefresh()
                 refreshLinkPreviews(in: textView)
                 fullRefreshAnchor?.restore(in: textView)
@@ -701,6 +811,25 @@ struct SourceEditorView: NSViewRepresentable {
             }
         }
 
+        /// Keeps the landing spot of every in-flight import in step with each
+        /// edit the text view is about to make. This delegate call carries the
+        /// exact range and replacement, unlike the text storage's edited range,
+        /// which attribute fixing can widen. Text applied from outside the
+        /// editor does not pass through here and drops the imports instead.
+        func textView(
+            _ textView: NSTextView,
+            shouldChangeTextIn affectedCharRange: NSRange,
+            replacementString: String?
+        ) -> Bool {
+            if let replacementString, !pendingAttachmentImports.isEmpty {
+                let newLength = (replacementString as NSString).length
+                pendingAttachmentImports = pendingAttachmentImports.mapValues {
+                    $0.adjusted(forEditReplacing: affectedCharRange, withLength: newLength)
+                }
+            }
+            return true
+        }
+
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
             guard !isApplyingExternalText else { return }
@@ -718,11 +847,13 @@ struct SourceEditorView: NSViewRepresentable {
             // force a full-document rescan whose cost scales with document
             // length; coalesce those off the per-keystroke path so a burst of
             // typing inside/around a code fence collapses into a single pass.
-            let needsFull = textView.textStorage.map {
-                highlighter.requiresFullRehighlight(for: editedRange, in: $0)
-            } ?? true
+            // The span and its code-block state are computed in one document
+            // walk here and handed straight to the highlighter.
+            let incrementalRange = textView.textStorage.flatMap {
+                highlighter.incrementalRange(for: editedRange, in: $0)
+            }
 
-            if needsFull {
+            guard let incrementalRange else {
                 scheduleFullHighlight(for: textView)
                 return
             }
@@ -731,7 +862,7 @@ struct SourceEditorView: NSViewRepresentable {
             highlight(
                 textView,
                 preservingViewport: false,
-                editedRange: editedRange
+                incrementalRange: incrementalRange
             )
 
             // If a fence-affecting edit is still awaiting its coalesced
@@ -750,7 +881,7 @@ struct SourceEditorView: NSViewRepresentable {
             forPartialWordRange charRange: NSRange,
             indexOfSelectedItem index: UnsafeMutablePointer<Int>?
         ) -> [String] {
-            let partial = (textView.string as NSString).substring(with: charRange)
+            let partial = textView.documentNSString.substring(with: charRange)
             let suggestions = WikiLinkCompletion.suggestions(
                 for: partial,
                 candidates: parent.noteLinkCompletions
@@ -761,7 +892,7 @@ struct SourceEditorView: NSViewRepresentable {
 
         private func offerWikiLinkCompletionsIfNeeded(in textView: NSTextView) {
             guard WikiLinkCompletion.partialRange(
-                in: textView.string,
+                in: textView.documentNSString,
                 selection: textView.selectedRange()
             ) != nil else { return }
 
@@ -962,6 +1093,9 @@ private protocol SourceTextViewDelegate: AnyObject {
     /// attempted, `false` if there is no link at the caret.
     @discardableResult
     func sourceTextViewOpenLinkAtCaret(_ textView: NSTextView) -> Bool
+    /// Returns `true` when the delegate took over the paste or drop (its
+    /// import may still be running in the background), or `false` to let the
+    /// text view handle it as usual.
     func sourceTextView(_ textView: NSTextView, importAttachmentFrom pasteboard: NSPasteboard) -> Bool
 }
 
@@ -970,7 +1104,7 @@ private final class SourceTextView: NSTextView {
     weak var attachmentDelegate: SourceTextViewDelegate?
 
     override var rangeForUserCompletion: NSRange {
-        WikiLinkCompletion.partialRange(in: string, selection: selectedRange())
+        WikiLinkCompletion.partialRange(in: documentNSString, selection: selectedRange())
             ?? NSRange(location: NSNotFound, length: 0)
     }
 
@@ -1020,6 +1154,15 @@ private final class SourceTextView: NSTextView {
         }
         actions.append(openLink)
         return actions
+    }
+}
+
+private extension NSTextView {
+    /// The document as an `NSString` for per-keystroke scanning. `string`
+    /// bridges the whole document into a Swift `String` (an O(n) copy) on every
+    /// read, whereas the text storage's backing string is handed over as is.
+    var documentNSString: NSString {
+        textStorage.map { $0.string as NSString } ?? (string as NSString)
     }
 }
 

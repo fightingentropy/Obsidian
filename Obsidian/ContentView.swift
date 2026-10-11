@@ -17,6 +17,11 @@ struct ContentView: View {
     @State private var selectedTemplate: TemplateDescriptor?
     @State private var workflowError: String?
     @State private var isVaultHealthPresented = false
+    // Derived from the vault inventory. Cached in state so the editor and the
+    // toolbar menu don't rebuild them on every keystroke; refreshed by the
+    // handlers in `observedDerivedState`.
+    @State private var noteLinkCompletions: [String] = []
+    @State private var availableTemplates: [TemplateDescriptor] = []
 
     init(
         workspace: Workspace,
@@ -91,7 +96,7 @@ struct ContentView: View {
             restoreExpandedFoldersIfNeeded()
             if !workspace.isLoadingSnapshot,
                workspaceSession.isLoaded(for: workspace.vaultURL) {
-                workspaceSession.prune(availableFiles: Set(workspace.files.map(\.url)))
+                workspaceSession.prune(availableFiles: sessionFileURLs)
             }
         }
         .onChange(of: workspace.isLoadingSnapshot) { _, _ in
@@ -127,8 +132,35 @@ struct ContentView: View {
         }
     }
 
-    var body: some View {
+    /// Refreshes the cached inventory-derived state. Kept separate from
+    /// `observedWorkspace` so the modifier chain stays within the type-checker's
+    /// budget. `searchIndexRevision` bumps whenever the note inventory or a
+    /// title changes; selection matters because the selected note's live title
+    /// can differ from its on-disk title.
+    private var observedDerivedState: some View {
         observedWorkspace
+        .onAppear {
+            refreshNoteLinkCompletions()
+            refreshAvailableTemplates()
+        }
+        .onChange(of: workspace.vaultURL) { _, _ in
+            refreshNoteLinkCompletions()
+            refreshAvailableTemplates()
+        }
+        .onChange(of: workspace.searchIndexRevision) { _, _ in
+            refreshNoteLinkCompletions()
+            refreshAvailableTemplates()
+        }
+        .onChange(of: workspace.selectedFileURL) { _, _ in
+            refreshNoteLinkCompletions()
+        }
+        .onChange(of: workflowConfiguration.templates) { _, _ in
+            refreshAvailableTemplates()
+        }
+    }
+
+    var body: some View {
+        observedDerivedState
         .sheet(item: $renameRequest) { request in
             RenameItemSheet(target: request) { proposedName in
                 try workspace.renameItem(request.url, to: proposedName)
@@ -465,7 +497,7 @@ struct ContentView: View {
                 text: $workspace.text,
                 documentURL: workspace.selectedFileURL,
                 vaultURL: workspace.vaultURL,
-                noteLinkCompletions: workspace.files.map { workspace.title(for: $0) },
+                noteLinkCompletions: noteLinkCompletions,
                 controller: controller,
                 preferences: preferences,
                 savedSelection: workspace.editorSelection(for: workspace.selectedFileURL),
@@ -480,7 +512,6 @@ struct ContentView: View {
 
     private var graphView: some View {
         NoteGraphView(workspace: workspace)
-            .id(workspace.selectedFileURL)
     }
 
     private var basesView: some View {
@@ -499,9 +530,18 @@ struct ContentView: View {
 // MARK: - Helpers
 
 private extension ContentView {
-    var availableTemplates: [TemplateDescriptor] {
-        guard let vaultURL = workspace.vaultURL else { return [] }
-        return (try? TemplateLibraryService().availableTemplates(
+    func refreshNoteLinkCompletions() {
+        noteLinkCompletions = workspace.files.map { workspace.title(for: $0) }
+    }
+
+    /// Enumerates the templates folder on disk, so this runs only when the
+    /// vault, its inventory, or the templates configuration changes.
+    func refreshAvailableTemplates() {
+        guard let vaultURL = workspace.vaultURL else {
+            availableTemplates = []
+            return
+        }
+        availableTemplates = (try? TemplateLibraryService().availableTemplates(
             in: vaultURL,
             configuration: workflowConfiguration.templates
         )) ?? []
@@ -530,7 +570,7 @@ private extension ContentView {
     func restoreWorkspaceSession() {
         guard workspaceSession.load(
             for: workspace.vaultURL,
-            availableFiles: Set(workspace.files.map(\.url)),
+            availableFiles: sessionFileURLs,
             inventoryReady: !workspace.isLoadingSnapshot
         ) else { return }
         workspaceSession.noteSelected(workspace.selectedFileURL)
@@ -562,6 +602,22 @@ private extension ContentView {
                 return [node.url] + Array(folderURLs(in: node.children))
             }
             return []
+        })
+    }
+
+    /// Every file-kind node in the sidebar, images included. `workspace.files`
+    /// lists markdown only, but selecting an image also opens a tab, so the
+    /// session must be restored and pruned against the full inventory.
+    var sessionFileURLs: Set<URL> {
+        fileURLs(in: workspace.sidebarNodes)
+    }
+
+    func fileURLs(in nodes: [SidebarNode]) -> Set<URL> {
+        Set(nodes.flatMap { node -> [URL] in
+            if node.isFolder {
+                return Array(fileURLs(in: node.children))
+            }
+            return [node.url]
         })
     }
 
@@ -726,36 +782,69 @@ private struct TitlebarIconButton: View {
     }
 }
 
-private struct EditorStatusBar: View {
-    let text: String
+/// Word, character, and paragraph totals for the editor status bar, gathered
+/// in a single pass over the text's Unicode scalars (words and paragraphs)
+/// plus a grapheme-cluster count for characters.
+struct EditorTextCounts: Equatable, Sendable {
+    var words = 0
+    var characters = 0
+    var paragraphs = 0
 
-    private var wordCount: Int {
-        text.split(whereSeparator: { $0.isWhitespace }).count
-    }
+    static let zero = EditorTextCounts()
 
-    private var paragraphCount: Int {
-        var count = 0
+    /// A word is a maximal run of non-whitespace scalars, characters are
+    /// user-visible grapheme clusters (matching `String.count`), and a
+    /// paragraph is a maximal run of non-blank lines.
+    static func compute(for text: String) -> EditorTextCounts {
+        var counts = EditorTextCounts()
+        var isInsideWord = false
+        var lineHasContent = false
         var isInsideParagraph = false
 
-        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
-            let isBlank = line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            if isBlank {
-                isInsideParagraph = false
-            } else if !isInsideParagraph {
-                count += 1
-                isInsideParagraph = true
+        counts.characters = text.count
+
+        for scalar in text.unicodeScalars {
+            if scalar == "\n" {
+                if lineHasContent {
+                    if !isInsideParagraph {
+                        counts.paragraphs += 1
+                        isInsideParagraph = true
+                    }
+                } else {
+                    isInsideParagraph = false
+                }
+                lineHasContent = false
+                isInsideWord = false
+            } else if scalar.properties.isWhitespace {
+                isInsideWord = false
+            } else {
+                lineHasContent = true
+                if !isInsideWord {
+                    counts.words += 1
+                    isInsideWord = true
+                }
             }
         }
 
-        return count
+        if lineHasContent, !isInsideParagraph {
+            counts.paragraphs += 1
+        }
+
+        return counts
     }
+}
+
+private struct EditorStatusBar: View {
+    let text: String
+
+    @State private var counts = EditorTextCounts.zero
 
     var body: some View {
         HStack(spacing: 18) {
             Spacer()
-            Text("\(wordCount.formatted()) words")
-            Text("\(text.count.formatted()) characters")
-            Text("\(paragraphCount.formatted()) paragraphs")
+            Text("\(counts.words.formatted()) words")
+            Text("\(counts.characters.formatted()) characters")
+            Text("\(counts.paragraphs.formatted()) paragraphs")
         }
         .font(.system(size: 10.5))
         .foregroundStyle(.tertiary)
@@ -764,8 +853,30 @@ private struct EditorStatusBar: View {
         .background(Color(nsColor: Theme.editorBackgroundColor))
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "\(wordCount) words, \(text.count) characters, \(paragraphCount) paragraphs"
+            "\(counts.words) words, \(counts.characters) characters, \(counts.paragraphs) paragraphs"
         )
+        .task(id: text) {
+            await refreshCounts()
+        }
+    }
+
+    /// Debounces the recount so rapid typing doesn't rescan the whole note on
+    /// every keystroke, then counts off the main actor. A newer edit cancels
+    /// the pending task before it assigns.
+    @MainActor
+    private func refreshCounts() async {
+        try? await Task.sleep(for: .milliseconds(150))
+        guard !Task.isCancelled else { return }
+
+        let text = self.text
+        let computed = await Task.detached(priority: .utility) {
+            EditorTextCounts.compute(for: text)
+        }.value
+        guard !Task.isCancelled else { return }
+
+        if counts != computed {
+            counts = computed
+        }
     }
 }
 
@@ -803,32 +914,63 @@ private struct MoreMenuLabel: View {
 private struct WindowToolbarConfigurator: NSViewRepresentable {
     let title: String
 
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
         DispatchQueue.main.async {
-            configureToolbar(for: view)
+            context.coordinator.configure(windowOf: view, title: title)
         }
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
+        // SwiftUI re-runs this on every keystroke. Skip the dispatch entirely
+        // when the window is already configured and the title is unchanged.
+        if let window = nsView.window,
+           window.title == title,
+           context.coordinator.isConfigured(window) {
+            return
+        }
         DispatchQueue.main.async {
-            configureToolbar(for: nsView)
+            context.coordinator.configure(windowOf: nsView, title: title)
         }
     }
 
-    private func configureToolbar(for view: NSView) {
-        guard let window = view.window, let toolbar = window.toolbar else { return }
-        window.title = title
-        window.titleVisibility = .hidden
-        window.titlebarAppearsTransparent = true
-        window.titlebarSeparatorStyle = .none
-        window.backgroundColor = Theme.editorBackgroundColor
-        window.toolbarStyle = .unified
-        toolbar.displayMode = .iconOnly
-        toolbar.sizeMode = .regular
-        toolbar.allowsUserCustomization = false
-        toolbar.autosavesConfiguration = false
+    @MainActor
+    final class Coordinator {
+        private weak var configuredWindow: NSWindow?
+        private weak var configuredToolbar: NSToolbar?
+
+        func isConfigured(_ window: NSWindow) -> Bool {
+            guard configuredWindow === window, let configuredToolbar else { return false }
+            return configuredToolbar === window.toolbar
+        }
+
+        func configure(windowOf view: NSView, title: String) {
+            guard let window = view.window, let toolbar = window.toolbar else { return }
+
+            if window.title != title {
+                window.title = title
+            }
+
+            // The remaining settings are static per window (and per toolbar,
+            // should SwiftUI ever swap the NSToolbar), so apply them once.
+            guard !isConfigured(window) else { return }
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
+            window.titlebarSeparatorStyle = .none
+            window.backgroundColor = Theme.editorBackgroundColor
+            window.toolbarStyle = .unified
+            toolbar.displayMode = .iconOnly
+            toolbar.sizeMode = .regular
+            toolbar.allowsUserCustomization = false
+            toolbar.autosavesConfiguration = false
+            configuredWindow = window
+            configuredToolbar = toolbar
+        }
     }
 }
 
@@ -877,6 +1019,7 @@ private struct TitlebarAccessoryInstaller<Content: View>: NSViewRepresentable {
         private let hostingView: NSHostingView<Content>
         private weak var attachedWindow: NSWindow?
         private var installedSize = NSSize.zero
+        private var installedFittingSize = NSSize.zero
 
         init(content: Content, layoutAttribute: NSLayoutConstraint.Attribute) {
             hostingView = NSHostingView(rootView: content)
@@ -894,6 +1037,18 @@ private struct TitlebarAccessoryInstaller<Content: View>: NSViewRepresentable {
             accessoryController.layoutAttribute = layoutAttribute
 
             let fittingSize = hostingView.fittingSize
+            let containerWindow = containerView.window
+            let isAttachedToWindow = containerWindow != nil && attachedWindow === containerWindow
+
+            // Most updates are keystrokes that change neither the window nor
+            // the accessory's measured size. The installed frames are still
+            // correct then, so there is nothing to re-lay-out or re-host.
+            if isAttachedToWindow,
+               abs(fittingSize.width - installedFittingSize.width) <= 0.5,
+               abs(fittingSize.height - installedFittingSize.height) <= 0.5 {
+                return
+            }
+
             // The accessory controller is anchored to the window's right edge,
             // so the extra width becomes trailing breathing room.
             let targetSize = NSSize(
@@ -917,8 +1072,9 @@ private struct TitlebarAccessoryInstaller<Content: View>: NSViewRepresentable {
             )
             accessoryView.setFrameSize(targetSize)
             installedSize = targetSize
+            installedFittingSize = fittingSize
 
-            guard let window = containerView.window else { return }
+            guard let window = containerWindow else { return }
 
             // An empty accessory has no useful titlebar presence. Waiting until it
             // has a width also avoids AppKit caching a zero-width view.
@@ -927,7 +1083,7 @@ private struct TitlebarAccessoryInstaller<Content: View>: NSViewRepresentable {
                 return
             }
 
-            if attachedWindow === window {
+            if isAttachedToWindow {
                 guard sizeChanged else { return }
 
                 // AppKit does not reliably relayout an already-installed titlebar

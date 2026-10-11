@@ -418,6 +418,253 @@ final class PreviewPipelineTests: XCTestCase {
         XCTAssertEqual(mermaidDocument.preferredRenderMode, .html)
         XCTAssertEqual(widthDocument.preferredRenderMode, .html)
     }
+
+    // MARK: - Asset index fingerprint and cache invalidation
+
+    func testAssetLookupFingerprintIsOrderIndependentAndTracksEntries() {
+        let vault = URL(fileURLWithPath: "/tmp/fingerprint-vault", isDirectory: true)
+        let entries: [(String, [URL])] = (0..<64).map { index in
+            ("file-\(index).png", [vault.appendingPathComponent("folder-\(index % 5)/file-\(index).png")])
+        }
+        var forward: [String: [URL]] = [:]
+        for (name, urls) in entries { forward[name] = urls }
+        var backward: [String: [URL]] = [:]
+        for (name, urls) in entries.reversed() { backward[name] = urls }
+
+        let forwardFingerprint = PreviewContext(documentURL: nil, vaultURL: vault, assetLookupByFilename: forward)
+            .assetLookupFingerprint
+        let backwardFingerprint = PreviewContext(documentURL: nil, vaultURL: vault, assetLookupByFilename: backward)
+            .assetLookupFingerprint
+        XCTAssertEqual(forwardFingerprint, backwardFingerprint, "Insertion order must not matter")
+
+        var added = forward
+        added["extra.png"] = [vault.appendingPathComponent("extra.png")]
+        XCTAssertNotEqual(
+            PreviewContext(documentURL: nil, vaultURL: vault, assetLookupByFilename: added).assetLookupFingerprint,
+            forwardFingerprint,
+            "A newly indexed file changes the fingerprint"
+        )
+
+        var moved = forward
+        moved["file-0.png"] = [vault.appendingPathComponent("elsewhere/file-0.png")]
+        XCTAssertNotEqual(
+            PreviewContext(documentURL: nil, vaultURL: vault, assetLookupByFilename: moved).assetLookupFingerprint,
+            forwardFingerprint,
+            "A file moving between folders (same filename) changes the fingerprint"
+        )
+    }
+
+    func testPreprocessCachedReResolvesEmbedWhenAssetIndexGainsTheFile() throws {
+        let fixture = try makeFixture()
+        let droppedURL = fixture.bareFilenameImageURL
+            .deletingLastPathComponent()
+            .appendingPathComponent("dropped-image.png")
+        let markdown = "![[dropped-image.png]]"
+
+        let unresolved = MarkdownPreprocessor.preprocessCached(markdown, context: fixture.context)
+        XCTAssertEqual(unresolved.normalizedMarkdown, markdown, "Not indexed yet, so the embed stays verbatim")
+
+        // Simulate dropping an image into the vault: the file appears on disk
+        // and the asset index gains an entry, while the note text is unchanged.
+        try fixturePNGData().write(to: droppedURL)
+        var indexedContext = fixture.context
+        indexedContext.assetLookupByFilename["dropped-image.png"] = [droppedURL]
+        XCTAssertNotEqual(indexedContext.assetLookupFingerprint, fixture.context.assetLookupFingerprint)
+
+        let expectedURL = try XCTUnwrap(
+            AssetResolver(context: indexedContext).resolve(reference: "dropped-image.png")?.fileURL
+        )
+        let resolved = MarkdownPreprocessor.preprocessCached(markdown, context: indexedContext)
+        XCTAssertEqual(
+            resolved.normalizedMarkdown,
+            "![dropped-image](<\(expectedURL.absoluteString)>)",
+            "Same text and document, but the changed asset index must bypass the cached parse"
+        )
+    }
+
+    func testAssetResolverDoesNotWalkVaultForUnindexedBareFilename() throws {
+        let fixture = try makeFixture()
+        let unindexedURL = fixture.bareFilenameImageURL
+            .deletingLastPathComponent()
+            .appendingPathComponent("unindexed-image.png")
+        try fixturePNGData().write(to: unindexedURL)
+
+        let resolver = AssetResolver(context: fixture.context)
+        XCTAssertNil(
+            resolver.resolve(reference: "unindexed-image.png"),
+            "Bare filenames resolve through the asset index only; the vault is never enumerated"
+        )
+    }
+
+    // MARK: - Post-processing passes
+
+    func testHTMLRendererKeepsTextBetweenMultipleMathTokensInOrder() throws {
+        let fixture = try makeFixture()
+        let markdown = """
+        A $$x$$ B $$y$$ C
+
+        D \\(z\\) E \\(w\\) F
+        """
+
+        let document = MarkdownPreprocessor.preprocess(markdown, context: fixture.context)
+        let html = HTMLPreviewRenderer.render(document: document)
+
+        XCTAssertTrue(
+            html.contains("<p>A <span class=\"math-display\">x</span> B <span class=\"math-display\">y</span> C</p>"),
+            html
+        )
+        XCTAssertTrue(
+            html.contains("<p>D <span class=\"math-inline\">z</span> E <span class=\"math-inline\">w</span> F</p>"),
+            html
+        )
+        XCTAssertFalse(html.contains(MathTokenCoder.displayPrefix), html)
+        XCTAssertFalse(html.contains(MathTokenCoder.inlinePrefix), html)
+    }
+
+    func testHTMLRendererNeutralizesDangerousSchemesInEveryQuoteStyle() throws {
+        let fixture = try makeFixture()
+        let markdown = """
+        [one](javascript:alert(1)) and [two](vbscript:msgbox) and [three](data:text/html,hi)
+
+        ![ok](data:image/png;base64,AAAA)
+        """
+
+        let document = MarkdownPreprocessor.preprocess(markdown, context: fixture.context)
+        let html = HTMLPreviewRenderer.render(document: document)
+
+        XCTAssertFalse(html.lowercased().contains("javascript:"), html)
+        XCTAssertFalse(html.lowercased().contains("vbscript:"), html)
+        XCTAssertFalse(html.contains("data:text/html"), html)
+        XCTAssertTrue(html.contains("data:image/png"), "data:image/ sources must survive: \(html)")
+    }
+
+    // MARK: - Segment identity
+
+    func testIdentifiedSegmentsKeepEmbedIdentityWhenParagraphInsertedAbove() throws {
+        let fixture = try makeFixture()
+        let embedURL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        let before = MarkdownPreprocessor.preprocess(
+            "Intro\n\n\(embedURL)\n\nOutro",
+            context: fixture.context
+        )
+        let after = MarkdownPreprocessor.preprocess(
+            "New paragraph\n\nIntro\n\n\(embedURL)\n\nOutro",
+            context: fixture.context
+        )
+
+        func embedID(in document: PreviewDocument) -> String? {
+            document.identifiedSegments.first { identified in
+                if case .embed = identified.segment { return true }
+                return false
+            }?.id
+        }
+
+        XCTAssertEqual(before.preferredRenderMode, .embedded)
+        XCTAssertNotNil(embedID(in: before))
+        XCTAssertEqual(embedID(in: before), embedID(in: after), "The embed keeps its identity after an insertion above it")
+        // The text on either side of the embed is the same structural slot, so
+        // inserting above the embed keeps every segment's identity.
+        XCTAssertEqual(before.identifiedSegments.map(\.id), after.identifiedSegments.map(\.id))
+        XCTAssertEqual(after.identifiedSegments.count, after.segments.count)
+        XCTAssertEqual(Set(after.identifiedSegments.map(\.id)).count, after.segments.count, "Every id is unique")
+    }
+
+    func testIdentifiedSegmentsKeepIdentityWhenTypingInsideASegment() throws {
+        let fixture = try makeFixture()
+        let embedURL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        func ids(_ markdown: String) -> [String] {
+            MarkdownPreprocessor.preprocess(markdown, context: fixture.context).identifiedSegments.map(\.id)
+        }
+
+        let original = ids("Intro\n\n\(embedURL)\n\nOutro\n\n```mermaid\ngraph TD\nA-->B\n```\n")
+        XCTAssertGreaterThanOrEqual(original.count, 4)
+
+        // A keystroke in the paragraph above the embed, one below it, and one
+        // inside the mermaid block must each leave every id untouched, or
+        // SwiftUI would recreate that segment's web view per keystroke.
+        XCTAssertEqual(original, ids("Intro!\n\n\(embedURL)\n\nOutro\n\n```mermaid\ngraph TD\nA-->B\n```\n"))
+        XCTAssertEqual(original, ids("Intro\n\n\(embedURL)\n\nOutro!\n\n```mermaid\ngraph TD\nA-->B\n```\n"))
+        XCTAssertEqual(original, ids("Intro\n\n\(embedURL)\n\nOutro\n\n```mermaid\ngraph TD\nA-->B\nB-->C\n```\n"))
+        XCTAssertEqual(Set(original).count, original.count, "Every id is unique: \(original)")
+    }
+
+    func testIdentifiedSegmentsDoNotShiftLaterSegmentsWhenTextIsInsertedAboveMultipleEmbeds() throws {
+        let fixture = try makeFixture()
+        let first = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        let second = "https://www.youtube.com/watch?v=9bZkp7q19f0"
+        func ids(_ markdown: String) -> [String] {
+            MarkdownPreprocessor.preprocess(markdown, context: fixture.context).identifiedSegments.map(\.id)
+        }
+
+        let before = ids("A\n\n\(first)\n\nB\n\n\(second)\n\nC")
+        let after = ids("Top\n\nA\n\n\(first)\n\nB\n\n\(second)\n\nC")
+        XCTAssertEqual(before, after)
+        XCTAssertEqual(Set(before).count, before.count, "Every id is unique: \(before)")
+    }
+
+    func testIdentifiedSegmentsDisambiguateDuplicateContent() throws {
+        let fixture = try makeFixture()
+        let markdown = """
+        ```mermaid
+        graph TD
+        A-->B
+        ```
+
+        ```mermaid
+        graph TD
+        A-->B
+        ```
+        """
+
+        let document = MarkdownPreprocessor.preprocess(markdown, context: fixture.context)
+        let ids = document.identifiedSegments.map(\.id)
+
+        XCTAssertEqual(ids.count, document.segments.count)
+        XCTAssertEqual(Set(ids).count, ids.count, "Identical segments must still get distinct ids: \(ids)")
+        XCTAssertEqual(ids.filter { $0.contains("/mermaid#") }.count, 2)
+    }
+
+    // MARK: - Image attachments
+
+    func testImageSizeReadsPixelDimensionsFromImageMetadata() throws {
+        let size = try PreviewImageSourceLoader.imageSize(
+            for: try fixturePNGData(),
+            url: URL(fileURLWithPath: "/tmp/fixture.png")
+        )
+        XCTAssertEqual(size, CGSize(width: 1, height: 1))
+
+        XCTAssertThrowsError(
+            try PreviewImageSourceLoader.imageSize(
+                for: Data("not an image".utf8),
+                url: URL(fileURLWithPath: "/tmp/broken.png")
+            )
+        )
+    }
+
+    func testPixelSizeHonorsRotatedOrientations() {
+        XCTAssertEqual(
+            PreviewImageSourceLoader.pixelSize(width: 400, height: 200, orientation: 1),
+            CGSize(width: 400, height: 200)
+        )
+        XCTAssertEqual(
+            PreviewImageSourceLoader.pixelSize(width: 400, height: 200, orientation: 4),
+            CGSize(width: 400, height: 200)
+        )
+        for orientation in UInt32(5)...8 {
+            XCTAssertEqual(
+                PreviewImageSourceLoader.pixelSize(width: 400, height: 200, orientation: orientation),
+                CGSize(width: 200, height: 400),
+                "orientation \(orientation) rotates by 90°"
+            )
+        }
+        XCTAssertNil(PreviewImageSourceLoader.pixelSize(width: 0, height: 200, orientation: 1))
+    }
+
+    func testPreviewDecodedImageHoldsDecodedBitmap() throws {
+        let decoded = PreviewDecodedImage(data: try fixturePNGData())
+        XCTAssertNotNil(decoded.image)
+        XCTAssertEqual(decoded.image?.representations.first?.pixelsWide, 1)
+    }
 }
 
 private struct PreviewFixture {
@@ -429,12 +676,20 @@ private struct PreviewFixture {
     let pdfURL: URL
 }
 
-private func makeFixture() throws -> PreviewFixture {
-    let rootURL = FileManager.default.temporaryDirectory
-        .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        .standardizedFileURL
-    try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+private extension XCTestCase {
+    /// Builds a throwaway vault under the temporary directory and removes it
+    /// again when the current test finishes.
+    func makeFixture() throws -> PreviewFixture {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            .standardizedFileURL
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: rootURL) }
+        return try buildFixture(at: rootURL)
+    }
+}
 
+private func buildFixture(at rootURL: URL) throws -> PreviewFixture {
     let vaultURL = rootURL.appendingPathComponent("Vault", isDirectory: true)
     let notesURL = vaultURL.appendingPathComponent("Notes", isDirectory: true)
     let assetsURL = vaultURL.appendingPathComponent("assets", isDirectory: true)
@@ -458,9 +713,24 @@ private func makeFixture() throws -> PreviewFixture {
     try fixturePNGData().write(to: bareFilenameImageURL)
     try Data("%PDF-1.4".utf8).write(to: pdfURL)
 
+    // Mirrors the workspace asset index, which lists every regular file in
+    // the vault. Bare-filename references resolve only through this index;
+    // the resolver no longer enumerates the vault on disk.
+    let assetLookupByFilename: [String: [URL]] = [
+        documentURL.lastPathComponent: [documentURL],
+        documentImageURL.lastPathComponent: [documentImageURL],
+        vaultImageURL.lastPathComponent: [vaultImageURL],
+        bareFilenameImageURL.lastPathComponent: [bareFilenameImageURL],
+        pdfURL.lastPathComponent: [pdfURL],
+    ]
+
     return PreviewFixture(
         rootURL: rootURL,
-        context: PreviewContext(documentURL: documentURL, vaultURL: vaultURL),
+        context: PreviewContext(
+            documentURL: documentURL,
+            vaultURL: vaultURL,
+            assetLookupByFilename: assetLookupByFilename
+        ),
         documentImageURL: documentImageURL,
         vaultImageURL: vaultImageURL,
         bareFilenameImageURL: bareFilenameImageURL,
@@ -674,5 +944,142 @@ final class LinkParserParityTests: XCTestCase {
                 )
             }
         }
+    }
+}
+
+/// The stylesheet memo and the rendered-page cache are main-actor bound
+/// (they read `AppPreferences`), so these run on the main actor.
+@MainActor
+final class PreviewRenderingCacheTests: XCTestCase {
+    func testStylesheetFollowsPreferenceChangesWithoutGoingStale() throws {
+        let preferences = try makePreferences()
+        preferences.previewFontSize = 15
+
+        let first = PreviewStylesheet.css(using: preferences)
+        XCTAssertEqual(PreviewStylesheet.css(using: preferences), first)
+        XCTAssertTrue(first.contains("font-size: 15px"), first)
+
+        preferences.previewFontSize = 18
+        let resized = PreviewStylesheet.css(using: preferences)
+        XCTAssertNotEqual(resized, first)
+        XCTAssertTrue(resized.contains("font-size: 18px"), resized)
+
+        preferences.previewFontSize = 15
+        XCTAssertEqual(PreviewStylesheet.css(using: preferences), first)
+        XCTAssertEqual(
+            PreviewStylesheet.StyleSignature(preferences: preferences),
+            PreviewStylesheet.StyleSignature(preferences: preferences)
+        )
+    }
+
+    func testPreviewPageCacheServesIdenticalPageForUnchangedInput() throws {
+        let preferences = try makePreferences()
+        let context = PreviewContext(
+            documentURL: URL(fileURLWithPath: "/tmp/page-cache-vault/Note.md"),
+            vaultURL: URL(fileURLWithPath: "/tmp/page-cache-vault", isDirectory: true)
+        )
+        let document = MarkdownPreprocessor.preprocess("# Title\n\nInline $$x$$ math.", context: context)
+
+        let first = PreviewPageCache.page(for: document, preferences: preferences, compact: false)
+        let second = PreviewPageCache.page(for: document, preferences: preferences, compact: false)
+        XCTAssertEqual(first, second)
+        XCTAssertTrue(first.contains("<h1>Title</h1>"), first)
+        XCTAssertTrue(first.contains("class=\"math-display\""), first)
+
+        let compact = PreviewPageCache.page(for: document, preferences: preferences, compact: true)
+        XCTAssertNotEqual(compact, first)
+        XCTAssertTrue(compact.contains("overflow:hidden"), compact)
+
+        preferences.previewFontSize = 20
+        let restyled = PreviewPageCache.page(for: document, preferences: preferences, compact: false)
+        XCTAssertNotEqual(restyled, first, "A preference the stylesheet reads must miss the cache")
+        XCTAssertTrue(restyled.contains("font-size: 20px"), restyled)
+
+        let edited = MarkdownPreprocessor.preprocess("# Title\n\nEdited.", context: context)
+        let editedPage = PreviewPageCache.page(for: edited, preferences: preferences, compact: false)
+        XCTAssertNotEqual(editedPage, restyled)
+        XCTAssertTrue(editedPage.contains("Edited."), editedPage)
+    }
+
+    func testPreviewPageCacheDistinguishesSingleSegmentDocumentsSharingSource() throws {
+        let preferences = try makePreferences()
+        let context = PreviewContext(
+            documentURL: URL(fileURLWithPath: "/tmp/page-cache-vault/Note.md"),
+            vaultURL: URL(fileURLWithPath: "/tmp/page-cache-vault", isDirectory: true)
+        )
+        let full = MarkdownPreprocessor.preprocess("First\n\n$$\nx\n$$\n\nSecond", context: context)
+        XCTAssertGreaterThanOrEqual(full.segments.count, 1)
+
+        // The embedded preview renders each segment as its own fitted page
+        // that shares the parent's `source`; the cache must not conflate them.
+        let firstOnly = PreviewDocument(
+            source: full.source,
+            context: full.context,
+            segments: [.markdown("First")],
+            requiresHTMLFallback: true
+        )
+        let secondOnly = PreviewDocument(
+            source: full.source,
+            context: full.context,
+            segments: [.markdown("Second")],
+            requiresHTMLFallback: true
+        )
+
+        let firstPage = PreviewPageCache.page(for: firstOnly, preferences: preferences, compact: true)
+        let secondPage = PreviewPageCache.page(for: secondOnly, preferences: preferences, compact: true)
+        XCTAssertNotEqual(firstPage, secondPage)
+        XCTAssertTrue(firstPage.contains("<p>First</p>"), firstPage)
+        XCTAssertTrue(secondPage.contains("<p>Second</p>"), secondPage)
+    }
+
+    func testPreviewPageIsIdenticalForSegmentsRegardlessOfSurroundingNoteSource() throws {
+        let preferences = try makePreferences()
+        let context = PreviewContext(
+            documentURL: URL(fileURLWithPath: "/tmp/page-cache-vault/Note.md"),
+            vaultURL: URL(fileURLWithPath: "/tmp/page-cache-vault", isDirectory: true)
+        )
+
+        // Two keystrokes elsewhere in the note change the shared `source` but
+        // not this segment. Its page must be byte-identical (same cache entry,
+        // same CSP nonce) or the web view reloads on every keystroke.
+        func fitted(source: String) -> PreviewDocument {
+            PreviewDocument(
+                source: source,
+                context: context,
+                segments: [.markdown("Value $$x^2$$ here")],
+                requiresHTMLFallback: true
+            )
+        }
+
+        let first = PreviewPageCache.page(for: fitted(source: "Intro\n\nValue $$x^2$$ here"), preferences: preferences, compact: true)
+        let second = PreviewPageCache.page(for: fitted(source: "Intro!\n\nValue $$x^2$$ here"), preferences: preferences, compact: true)
+        XCTAssertEqual(first, second)
+        XCTAssertTrue(first.contains("Value"), first)
+    }
+
+    func testStylesheetPageIsDeterministicForAnUnchangedBody() throws {
+        let preferences = try makePreferences()
+        let body = "<p>Inline <span class=\"math-inline\">x</span></p>"
+
+        let first = PreviewStylesheet.page(body: body, preferences: preferences, compact: true)
+        // Not served from any cache: the page is a pure function of its inputs,
+        // so an unchanged body never makes the web view reload.
+        XCTAssertEqual(first, PreviewStylesheet.page(body: body, preferences: preferences, compact: true))
+
+        let other = PreviewStylesheet.page(body: body + "<p>More</p>", preferences: preferences, compact: true)
+        XCTAssertNotEqual(first, other)
+        XCTAssertTrue(first.contains("<script nonce=\""), first)
+        XCTAssertTrue(first.contains("script-src 'nonce-"), first)
+    }
+
+    /// Preferences backed by a throwaway defaults suite so the test never
+    /// touches the user's real settings.
+    private func makePreferences() throws -> AppPreferences {
+        let suiteName = "PreviewRenderingCacheTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        addTeardownBlock {
+            UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName)
+        }
+        return AppPreferences(userDefaults: defaults)
     }
 }

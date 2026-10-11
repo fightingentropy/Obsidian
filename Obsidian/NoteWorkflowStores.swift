@@ -226,8 +226,9 @@ final class SavedAdvancedSearchStore {
         let requestedIndex = id.flatMap { requestedID in
             searches.firstIndex { $0.id == requestedID }
         }
+        let normalizedCleanName = Self.normalizedName(cleanName)
         let sameNameIndex = searches.firstIndex {
-            $0.name.caseInsensitiveCompare(cleanName) == .orderedSame
+            Self.normalizedName($0.name) == normalizedCleanName
         }
         let existingIndex = requestedIndex ?? sameNameIndex
 
@@ -254,7 +255,7 @@ final class SavedAdvancedSearchStore {
         }
 
         searches.removeAll {
-            $0.id != saved.id && $0.name.caseInsensitiveCompare(saved.name) == .orderedSame
+            $0.id != saved.id && Self.normalizedName($0.name) == normalizedCleanName
         }
         searches.sort {
             $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
@@ -278,6 +279,12 @@ final class SavedAdvancedSearchStore {
         userDefaults.set(data, forKey: storageKey)
     }
 
+    /// The single notion of "same name" shared by saving and loading, so a
+    /// search that saves as unique never disappears on the next launch.
+    private static func normalizedName(_ name: String) -> String {
+        name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+    }
+
     private static func normalized(_ source: [SavedAdvancedSearch]) -> [SavedAdvancedSearch] {
         var seenIDs: Set<UUID> = []
         var seenNames: Set<String> = []
@@ -287,18 +294,14 @@ final class SavedAdvancedSearchStore {
                     && !ObsidianAdvancedSearchParser.parse($0.query).isEmpty
             }
             .sorted {
-                if $0.name.caseInsensitiveCompare($1.name) == .orderedSame {
+                if normalizedName($0.name) == normalizedName($1.name) {
                     return $0.updatedAt > $1.updatedAt
                 }
                 return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
             }
             .filter { search in
-                let normalizedName = search.name.folding(
-                    options: [.caseInsensitive, .diacriticInsensitive],
-                    locale: .current
-                )
-                return seenIDs.insert(search.id).inserted
-                    && seenNames.insert(normalizedName).inserted
+                seenIDs.insert(search.id).inserted
+                    && seenNames.insert(normalizedName(search.name)).inserted
             }
     }
 }

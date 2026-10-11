@@ -71,13 +71,15 @@ struct ObsidianSearchMetadata: Equatable, Sendable {
 }
 
 enum ObsidianMetadataParser {
+    /// Matches a closing ATX hash run (`## Title ##`) so it can be stripped.
+    private static let trailingHashRunPattern = try! NSRegularExpression(pattern: #"\s+#+\s*$"#)
+
     static func parse(_ markdown: String) -> ObsidianDocumentMetadata {
         let lines = sourceLines(in: markdown)
         let frontmatterParse = parseFrontmatter(in: markdown, lines: lines)
         let properties = frontmatterParse.frontmatter?.properties ?? [:]
 
         let title = scalarString(forKeys: ["title"], in: properties)
-        let aliases = stringList(forKeys: ["aliases", "alias"], in: properties)
         let frontmatterTags = stringList(forKeys: ["tags", "tag"], in: properties)
             .compactMap(normalizedTag(_:))
 
@@ -87,12 +89,19 @@ enum ObsidianMetadataParser {
         return ObsidianDocumentMetadata(
             frontmatter: frontmatterParse.frontmatter,
             title: title,
-            aliases: uniquedCaseInsensitive(aliases),
+            aliases: aliases(in: properties),
             frontmatterTags: uniquedCaseInsensitive(frontmatterTags),
             inlineTags: extractInlineTags(from: bodyLines),
             properties: properties,
             outline: buildOutline(from: bodyLines)
         )
+    }
+
+    /// The de-duplicated `aliases`/`alias` list of already parsed frontmatter
+    /// properties. Callers that cache `ObsidianSearchMetadata` can resolve
+    /// aliases from it without re-parsing the note body.
+    static func aliases(in properties: [String: ObsidianPropertyValue]) -> [String] {
+        uniquedCaseInsensitive(stringList(forKeys: ["aliases", "alias"], in: properties))
     }
 
     static func searchMetadata(in markdown: String) -> ObsidianSearchMetadata {
@@ -186,6 +195,7 @@ enum ObsidianMetadataParser {
             }
 
             if line.first?.isWhitespace != true,
+               !isBlockSequenceItem(line),
                let delimiter = topLevelKeyDelimiter(in: line) {
                 flush()
                 let key = line[..<delimiter].trimmingCharacters(in: .whitespaces)
@@ -204,6 +214,14 @@ enum ObsidianMetadataParser {
             result[buffer.key] = decodeProperty(buffer)
         }
         return result
+    }
+
+    /// Block-sequence items (`- url: a`) belong to the key above them even at
+    /// column 0, as `ObsidianPropertyEditor` treats them, so a colon inside an
+    /// item never starts a bogus top-level key such as `- url`.
+    private static func isBlockSequenceItem(_ line: String) -> Bool {
+        let unindented = line.drop(while: { $0 == " " || $0 == "\t" })
+        return unindented == "-" || unindented.hasPrefix("- ")
     }
 
     private static func topLevelKeyDelimiter(in line: String) -> String.Index? {
@@ -276,11 +294,51 @@ enum ObsidianMetadataParser {
         if lowered == "true" { return .boolean(true) }
         if lowered == "false" { return .boolean(false) }
         if lowered == "null" || lowered == "~" { return .null }
-        if let number = Double(value), value.range(of: #"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$"#, options: .regularExpression) != nil {
+        if let number = Double(value), isPlainDecimalLiteral(value) {
             return .number(number)
         }
 
         return .string(decodeSimpleString(value))
+    }
+
+    /// Accepts exactly what the former `^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$` check
+    /// did: an optional sign followed by digits with an optional fraction, or
+    /// a fraction alone. Exponents, hexadecimal and `inf`/`nan` spellings that
+    /// `Double.init` would accept therefore stay strings. Only ASCII digits
+    /// need checking because `Double.init` rejects every other digit system.
+    private static func isPlainDecimalLiteral(_ value: String) -> Bool {
+        let scalars = Array(value.unicodeScalars)
+        var index = 0
+        if index < scalars.count, scalars[index] == "+" || scalars[index] == "-" {
+            index += 1
+        }
+
+        var integerDigits = 0
+        while index < scalars.count, isASCIIDigit(scalars[index]) {
+            integerDigits += 1
+            index += 1
+        }
+
+        var hasFractionSeparator = false
+        var fractionDigits = 0
+        if index < scalars.count, scalars[index] == "." {
+            hasFractionSeparator = true
+            index += 1
+            while index < scalars.count, isASCIIDigit(scalars[index]) {
+                fractionDigits += 1
+                index += 1
+            }
+        }
+
+        guard index == scalars.count else { return false }
+        if hasFractionSeparator {
+            return integerDigits > 0 || fractionDigits > 0
+        }
+        return integerDigits > 0
+    }
+
+    private static func isASCIIDigit(_ scalar: Unicode.Scalar) -> Bool {
+        (48...57).contains(scalar.value)
     }
 
     private static func decodeInlineList(_ body: String) -> [String]? {
@@ -546,7 +604,9 @@ enum ObsidianMetadataParser {
         guard afterHashes.isEmpty || afterHashes.first?.isWhitespace == true else { return nil }
 
         var title = afterHashes.trimmingCharacters(in: .whitespaces)
-        if let hashRun = title.range(of: #"\s+#+\s*$"#, options: .regularExpression) {
+        let titleRange = NSRange(title.startIndex..<title.endIndex, in: title)
+        if let match = trailingHashRunPattern.firstMatch(in: title, range: titleRange),
+           let hashRun = Range(match.range, in: title) {
             title.removeSubrange(hashRun)
         }
         guard !title.isEmpty else { return nil }

@@ -7,6 +7,7 @@ struct TemplateCreationSheet: View {
     let onCreated: (URL) -> Void
 
     @Environment(\.dismiss) private var dismiss
+    @FocusState private var isTitleFieldFocused: Bool
     @State private var title = ""
     @State private var destinationFolder = ""
     @State private var errorMessage: String?
@@ -21,9 +22,12 @@ struct TemplateCreationSheet: View {
 
             TextField("Note title", text: $title)
                 .textFieldStyle(.roundedBorder)
+                .focused($isTitleFieldFocused)
+                .onSubmit { submit() }
 
             TextField("Destination folder (optional)", text: $destinationFolder)
                 .textFieldStyle(.roundedBorder)
+                .onSubmit { submit() }
 
             if let errorMessage {
                 Text(errorMessage)
@@ -34,16 +38,28 @@ struct TemplateCreationSheet: View {
             HStack {
                 Spacer()
                 Button("Cancel", role: .cancel) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
                 Button("Create") { create() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canCreate)
             }
         }
         .padding(24)
         .frame(width: 440)
         .onAppear {
             title = template.displayName
+            isTitleFieldFocused = true
         }
+    }
+
+    private var canCreate: Bool {
+        !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func submit() {
+        guard canCreate else { return }
+        create()
     }
 
     private func create() {

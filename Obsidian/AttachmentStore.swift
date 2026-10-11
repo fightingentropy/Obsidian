@@ -20,12 +20,87 @@ enum AttachmentStoreError: LocalizedError {
     }
 }
 
-struct ImportedAttachment: Equatable {
+struct ImportedAttachment: Equatable, Sendable {
     let fileURL: URL
     let vaultRelativePath: String
 
     var markdownEmbed: String {
         "![[\(vaultRelativePath)]]"
+    }
+}
+
+/// A paste or drop captured on the main actor: what the pasteboard offered
+/// and where it should land. It holds plain values rather than the
+/// pasteboard, so the slow half of the import can run off the main actor.
+struct AttachmentImportRequest: Equatable, Sendable {
+    enum Payload: Equatable, Sendable {
+        /// A file pasted or dropped from Finder, copied into the vault.
+        case file(URL)
+        /// PNG bytes, written as they are.
+        case png(Data)
+        /// TIFF bytes (screenshots and many apps), transcoded to PNG.
+        case tiff(Data)
+    }
+
+    let payload: Payload
+    let documentURL: URL?
+    let vaultURL: URL
+}
+
+/// Marks where a paste or drop will land while its attachment is imported in
+/// the background. The editor text is left untouched meanwhile: nothing
+/// temporary is ever typed into the note, so it cannot be autosaved, survive
+/// a note switch, or come back through undo. The anchor only follows later
+/// edits so the embed still lands where the paste was made.
+struct AttachmentImportAnchor: Equatable, Sendable {
+    /// The text the paste replaces (the selection), or an empty range at the
+    /// caret.
+    let range: NSRange
+
+    /// Where the anchor sits after the characters in `edited` (a range of the
+    /// old text) were replaced by `newLength` UTF-16 units. Edits before the
+    /// anchor, including an insertion at its start, shift it; edits after it,
+    /// including an insertion at its end, leave it; an edit that overlaps it
+    /// collapses it to just past the replacement, so the embed is added there
+    /// instead of replacing text the user has since changed.
+    func adjusted(forEditReplacing edited: NSRange, withLength newLength: Int) -> AttachmentImportAnchor {
+        if NSMaxRange(edited) <= range.location {
+            let delta = newLength - edited.length
+            return AttachmentImportAnchor(
+                range: NSRange(location: max(0, range.location + delta), length: range.length)
+            )
+        }
+        if edited.location >= NSMaxRange(range) {
+            return self
+        }
+        return AttachmentImportAnchor(range: NSRange(location: edited.location + newLength, length: 0))
+    }
+
+    /// Where `selection` belongs once `replaced` holds `replacementLength`
+    /// UTF-16 units: unchanged before it, shifted after it, resized when it
+    /// spans it, and collapsed to just past the replacement when it only
+    /// partly overlapped it. A selection that is exactly `replaced` (the
+    /// caret has not moved since the paste) ends up as a caret after the
+    /// replacement, as after an ordinary paste.
+    static func adjustedSelection(
+        _ selection: NSRange,
+        afterReplacing replaced: NSRange,
+        withLength replacementLength: Int
+    ) -> NSRange {
+        if selection == replaced {
+            return NSRange(location: replaced.location + replacementLength, length: 0)
+        }
+        let delta = replacementLength - replaced.length
+        if selection.location >= NSMaxRange(replaced) {
+            return NSRange(location: selection.location + delta, length: selection.length)
+        }
+        if NSMaxRange(selection) <= replaced.location {
+            return selection
+        }
+        if selection.location <= replaced.location, NSMaxRange(selection) >= NSMaxRange(replaced) {
+            return NSRange(location: selection.location, length: selection.length + delta)
+        }
+        return NSRange(location: replaced.location + replacementLength, length: 0)
     }
 }
 
@@ -35,39 +110,107 @@ enum AttachmentStore {
         "avif", "gif", "heic", "jpeg", "jpg", "png", "svg", "tif", "tiff", "webp"
     ]
 
+    /// Imports the first attachment on `pasteboard` in one blocking step on
+    /// the main actor. The editor splits this into
+    /// `importRequest(from:documentURL:vaultURL:)` and `importAttachment(_:)`
+    /// instead, so a large paste never stalls typing; this entry point stays
+    /// for callers (and tests) that want the whole import at once. Returns
+    /// nil when the pasteboard holds nothing importable.
     @MainActor
     static func importFirstAttachment(
         from pasteboard: NSPasteboard,
         documentURL: URL?,
         vaultURL: URL?
     ) throws -> ImportedAttachment? {
+        guard let request = try importRequest(
+            from: pasteboard,
+            documentURL: documentURL,
+            vaultURL: vaultURL
+        ) else {
+            return nil
+        }
+        return try performImport(request)
+    }
+
+    /// Reads the first importable item off `pasteboard`: a file URL, else PNG
+    /// data, else TIFF data. This read is the only part of an import that
+    /// needs the main actor. Returns nil when the pasteboard holds none of
+    /// these, and throws `missingVault` when no vault is open.
+    @MainActor
+    static func importRequest(
+        from pasteboard: NSPasteboard,
+        documentURL: URL?,
+        vaultURL: URL?
+    ) throws -> AttachmentImportRequest? {
         guard let vaultURL else { throw AttachmentStoreError.missingVault }
 
+        let payload: AttachmentImportRequest.Payload
         if let sourceURL = fileURL(from: pasteboard) {
-            return try importFile(sourceURL, documentURL: documentURL, vaultURL: vaultURL)
+            payload = .file(sourceURL)
+        } else if let pngData = pasteboard.data(forType: .png) {
+            payload = .png(pngData)
+        } else if let tiffData = pasteboard.data(forType: .tiff) {
+            payload = .tiff(tiffData)
+        } else {
+            return nil
         }
+        return AttachmentImportRequest(payload: payload, documentURL: documentURL, vaultURL: vaultURL)
+    }
 
-        if let pngData = pasteboard.data(forType: .png) {
+    /// Performs `request` on a detached task, so the TIFF transcode, the file
+    /// copy and the fsync'd write never run on the main actor, whatever the
+    /// caller's isolation. Throws `unsupportedAttachment` when TIFF data
+    /// cannot be decoded.
+    static func importAttachment(_ request: AttachmentImportRequest) async throws -> ImportedAttachment {
+        try await Task.detached(priority: .userInitiated) { () throws -> ImportedAttachment in
+            guard let attachment = try AttachmentStore.performImport(request) else {
+                throw AttachmentStoreError.unsupportedAttachment
+            }
+            return attachment
+        }.value
+    }
+
+    /// The blocking half of an import: copies the file, or writes the PNG
+    /// (transcoding TIFF first), with the collision handling and vault
+    /// containment checks of `importFile` and `importImageData`. Returns nil
+    /// when TIFF data cannot be decoded.
+    static func performImport(
+        _ request: AttachmentImportRequest,
+        fileManager: FileManager = .default
+    ) throws -> ImportedAttachment? {
+        switch request.payload {
+        case .file(let sourceURL):
+            return try importFile(
+                sourceURL,
+                documentURL: request.documentURL,
+                vaultURL: request.vaultURL,
+                fileManager: fileManager
+            )
+        case .png(let pngData):
             return try importImageData(
                 pngData,
                 suggestedFilename: pastedImageFilename(extension: "png"),
-                documentURL: documentURL,
-                vaultURL: vaultURL
+                documentURL: request.documentURL,
+                vaultURL: request.vaultURL,
+                fileManager: fileManager
             )
-        }
-
-        if let tiffData = pasteboard.data(forType: .tiff),
-           let bitmap = NSBitmapImageRep(data: tiffData),
-           let pngData = bitmap.representation(using: .png, properties: [:]) {
+        case .tiff(let tiffData):
+            guard let pngData = pngRepresentation(ofTIFF: tiffData) else { return nil }
             return try importImageData(
                 pngData,
                 suggestedFilename: pastedImageFilename(extension: "png"),
-                documentURL: documentURL,
-                vaultURL: vaultURL
+                documentURL: request.documentURL,
+                vaultURL: request.vaultURL,
+                fileManager: fileManager
             )
         }
+    }
 
-        return nil
+    /// Re-encodes TIFF data as PNG, or returns nil when it cannot be decoded.
+    /// The bitmap never leaves this call, so it is safe off the main thread.
+    static func pngRepresentation(ofTIFF tiffData: Data) -> Data? {
+        guard let bitmap = NSBitmapImageRep(data: tiffData) else { return nil }
+        return bitmap.representation(using: .png, properties: [:])
     }
 
     static func importFile(
@@ -140,8 +283,11 @@ enum AttachmentStore {
         let configuredPath = obsidianAttachmentFolderPath(vaultURL: vault)
 
         let candidate: URL
-        if let configuredPath, configuredPath == "." {
-            candidate = documentURL?.deletingLastPathComponent() ?? vault
+        if let configuredPath, let subfolder = documentRelativeSubfolder(configuredPath) {
+            // Obsidian writes "./" for "same folder as current file" and
+            // "./name" for "subfolder under current folder".
+            let base = documentURL?.deletingLastPathComponent() ?? vault
+            candidate = subfolder.isEmpty ? base : base.appendingPathComponent(subfolder, isDirectory: true)
         } else if let configuredPath, !configuredPath.isEmpty {
             let relativePath = configuredPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             candidate = vault.appendingPathComponent(relativePath, isDirectory: true)
@@ -178,6 +324,14 @@ enum AttachmentStore {
             throw AttachmentStoreError.unsafeAttachmentFolder
         }
         return resolved
+    }
+
+    /// The subfolder relative to the note's directory for a document-relative
+    /// setting (`.`, `./`, `./sub`), or nil when the path is vault-relative.
+    static func documentRelativeSubfolder(_ configuredPath: String) -> String? {
+        if configuredPath == "." { return "" }
+        guard configuredPath.hasPrefix("./") else { return nil }
+        return configuredPath.dropFirst(2).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
     private static func obsidianAttachmentFolderPath(vaultURL: URL) -> String? {
@@ -319,10 +473,17 @@ enum AttachmentStore {
             : "bin"
         let rawBase = (filename as NSString).deletingPathExtension
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: " -_()."))
-        let base = rawBase.unicodeScalars
+        var base = rawBase.unicodeScalars
             .map { allowed.contains($0) ? Character(String($0)) : "-" }
             .reduce(into: "") { $0.append($1) }
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        // A leading dot would hide the file from the asset index. Trim around
+        // the dots until neither remains, so " .notes" cannot keep one behind
+        // leading whitespace.
+        while let first = base.first, first == "." || first.isWhitespace {
+            base.removeFirst()
+        }
+        base = base.trimmingCharacters(in: .whitespacesAndNewlines)
         let safeBase = base.isEmpty ? "Attachment" : base
         let rawExtension = (filename as NSString).pathExtension.lowercased()
         let safeExtension = rawExtension.range(of: "^[a-z0-9]{1,10}$", options: .regularExpression) != nil

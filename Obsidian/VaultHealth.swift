@@ -41,37 +41,42 @@ enum VaultHealthScanner {
         let metadata = Dictionary(uniqueKeysWithValues: notes.map {
             ($0.url.standardizedFileURL, ObsidianMetadataParser.parse($0.body))
         })
-        var targetLookup: [String: [URL]] = [:]
+        var targetLookup: [String: Set<URL>] = [:]
         for note in notes {
             let parsed = metadata[note.url.standardizedFileURL]
             let names = [note.url.deletingPathExtension().lastPathComponent, note.title, parsed?.title]
                 .compactMap { $0 } + (parsed?.aliases ?? [])
-            for name in names {
-                targetLookup[name.lowercased(), default: []].append(note.url)
+            // A note's stem, title, and frontmatter title usually coincide, so
+            // de-duplicate per note before counting how many notes share a name.
+            for name in Set(names.map { $0.lowercased() }) {
+                targetLookup[name, default: []].insert(note.url)
             }
         }
 
         var issues: [VaultHealthIssue] = []
-        for (name, urls) in targetLookup where urls.count > 1 {
+        for (name, urls) in targetLookup.sorted(by: { $0.key < $1.key }) where urls.count > 1 {
             issues.append(VaultHealthIssue(
                 severity: .warning,
                 title: "Duplicate note target",
                 detail: "“\(name)” resolves to \(urls.count) notes.",
-                fileURL: urls.first
+                fileURL: urls.sorted { $0.path < $1.path }.first
             ))
         }
 
         for note in notes {
             if hasUnterminatedFrontmatter(note.body) {
                 issues.append(VaultHealthIssue(
-                    severity: .error,
+                    severity: .warning,
                     title: "Unterminated frontmatter",
-                    detail: "The opening YAML delimiter has no closing delimiter.",
+                    detail: "The opening YAML delimiter has no closing delimiter, so the block is treated as ordinary Markdown.",
                     fileURL: note.url
                 ))
             }
 
-            for target in wikiTargets(in: note.body) {
+            // Links inside fenced or inline code are examples, not references.
+            let searchable = MarkdownNoteLinkExtractor.maskingCodeRegions(note.body)
+
+            for target in wikiTargets(in: searchable) {
                 let cleanTarget = target
                     .split(separator: "#", maxSplits: 1).first.map(String.init)?
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -87,7 +92,7 @@ enum VaultHealthScanner {
                 }
             }
 
-            for target in markdownImageTargets(in: note.body) where !isRemoteReference(target) {
+            for target in markdownImageTargets(in: searchable) where !isRemoteReference(target) {
                 if resolveLocalReference(target, from: note.url, vaultURL: vaultURL, fileManager: fileManager) == nil {
                     issues.append(missingIssue(target: target, note: note))
                 }
@@ -122,16 +127,20 @@ enum VaultHealthScanner {
         )
     }
 
+    private static let wikiTargetRegex = try! NSRegularExpression(pattern: #"!?\[\[([^\]|]+)"#)
+    private static let markdownImageRegex = try! NSRegularExpression(
+        pattern: #"!\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)"#
+    )
+
     private static func wikiTargets(in body: String) -> [String] {
-        regexCaptures(#"!?\[\[([^\]|]+)"#, in: body)
+        regexCaptures(wikiTargetRegex, in: body)
     }
 
     private static func markdownImageTargets(in body: String) -> [String] {
-        regexCaptures(#"!\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)"#, in: body)
+        regexCaptures(markdownImageRegex, in: body)
     }
 
-    private static func regexCaptures(_ pattern: String, in text: String) -> [String] {
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+    private static func regexCaptures(_ regex: NSRegularExpression, in text: String) -> [String] {
         let nsText = text as NSString
         return regex.matches(in: text, range: NSRange(location: 0, length: nsText.length)).compactMap {
             guard $0.numberOfRanges > 1, $0.range(at: 1).location != NSNotFound else { return nil }
@@ -139,13 +148,60 @@ enum VaultHealthScanner {
         }
     }
 
+    /// Mirrors `ObsidianMetadataParser`: the opening delimiter must be exactly
+    /// `---` on the first line (after an optional BOM) and a block without a
+    /// closing delimiter is ordinary Markdown. The scanner only flags the case
+    /// that looks like a property block the author forgot to close, i.e. the
+    /// first meaningful line (blank and `#` comment lines skipped) is a
+    /// top-level `key: value` line by the parser's own rules, so keys with
+    /// spaces, non-ASCII letters, or quotes are recognized too.
     private static func hasUnterminatedFrontmatter(_ body: String) -> Bool {
-        let lines = body.components(separatedBy: .newlines)
-        guard lines.first?.trimmingCharacters(in: .whitespacesAndNewlines) == "---" else { return false }
-        return !lines.dropFirst().contains { line in
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed == "---" || trimmed == "..."
+        let lines = body.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).map(String.init)
+        guard var first = lines.first else { return false }
+        if first.first == "\u{feff}" { first.removeFirst() }
+        guard first == "---", lines.count > 1 else { return false }
+        guard !lines.dropFirst().contains(where: { $0 == "---" || $0 == "..." }) else { return false }
+
+        for line in lines.dropFirst() {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+            return isTopLevelKeyLine(line)
         }
+        return false
+    }
+
+    /// Same acceptance rule as the metadata parser's top-level key detection:
+    /// not indented, not a block-sequence item, and a non-empty key before the
+    /// first colon that is not inside quotes.
+    private static func isTopLevelKeyLine(_ line: String) -> Bool {
+        guard line.first?.isWhitespace != true else { return false }
+        if line == "-" || line.hasPrefix("- ") { return false }
+
+        var quote: Character?
+        var escaped = false
+        for index in line.indices {
+            let character = line[index]
+            if escaped {
+                escaped = false
+                continue
+            }
+            if character == "\\", quote != nil {
+                escaped = true
+                continue
+            }
+            if character == "\"" || character == "'" {
+                if quote == character {
+                    quote = nil
+                } else if quote == nil {
+                    quote = character
+                }
+                continue
+            }
+            if character == ":", quote == nil {
+                return !line[..<index].trimmingCharacters(in: .whitespaces).isEmpty
+            }
+        }
+        return false
     }
 
     private static func resolveLocalReference(

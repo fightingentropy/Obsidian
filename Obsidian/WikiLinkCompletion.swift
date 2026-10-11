@@ -2,7 +2,13 @@ import Foundation
 
 enum WikiLinkCompletion {
     static func partialRange(in text: String, selection: NSRange) -> NSRange? {
-        let nsText = text as NSString
+        partialRange(in: text as NSString, selection: selection)
+    }
+
+    /// `NSString` entry point for the editor, which already holds the document
+    /// as an `NSString` and so avoids bridging it through a Swift `String`
+    /// copy on every keystroke.
+    static func partialRange(in nsText: NSString, selection: NSRange) -> NSRange? {
         guard selection.length == 0,
               selection.location <= nsText.length else { return nil }
 
@@ -18,30 +24,39 @@ enum WikiLinkCompletion {
         return partialRange
     }
 
+    private struct Match {
+        let original: String
+        let startsWithQuery: Bool
+    }
+
     static func suggestions(
         for partial: String,
         candidates: [String],
         limit: Int = 20
     ) -> [String] {
         let query = partial.trimmingCharacters(in: .whitespacesAndNewlines)
-        let foldedQuery = query.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+        let foldedQuery = fold(query)
 
-        return candidates
-            .filter { candidate in
-                foldedQuery.isEmpty || candidate.folding(
-                    options: [.caseInsensitive, .diacriticInsensitive],
-                    locale: nil
-                ).contains(foldedQuery)
-            }
+        // Fold each candidate exactly once; the filter and the prefix test both
+        // read the folded form, so neither the filter nor the sort comparator
+        // has to fold again.
+        var matches: [Match] = []
+        for candidate in candidates {
+            let folded = fold(candidate)
+            guard foldedQuery.isEmpty || folded.contains(foldedQuery) else { continue }
+            matches.append(Match(original: candidate, startsWithQuery: folded.hasPrefix(foldedQuery)))
+        }
+
+        return matches
             .sorted { lhs, rhs in
-                let leftStarts = lhs.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
-                    .hasPrefix(foldedQuery)
-                let rightStarts = rhs.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
-                    .hasPrefix(foldedQuery)
-                if leftStarts != rightStarts { return leftStarts }
-                return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
+                if lhs.startsWithQuery != rhs.startsWithQuery { return lhs.startsWithQuery }
+                return lhs.original.localizedCaseInsensitiveCompare(rhs.original) == .orderedAscending
             }
             .prefix(limit)
-            .map { $0 + "]]" }
+            .map { $0.original + "]]" }
+    }
+
+    private static func fold(_ value: String) -> String {
+        value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
     }
 }
